@@ -1,0 +1,241 @@
+:root {
+  --bg: #1a1a1a;
+  --bg-secondary: #2a2a2a;
+  --text: #ffffff;
+  --text-muted: #888888;
+  --accent: #3b82f6;
+  --success: #22c55e;
+  --warning: #eab308;
+  --error: #ef4444;
+  --recording: #ef4444;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+.app {
+  padding: 16px;
+  min-width: 320px;
+  max-width: 320px;
+  border-radius: 10px;
+  background: var(--bg);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 8px;
+  margin: -16px -16px 16px -16px;
+  cursor: grab;
+  border-radius: 10px 10px 0 0;
+}
+
+.header:active {
+  cursor: grabbing;
+}
+
+.header h1 {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.status-badge.idle {
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+}
+
+.status-badge.recording {
+  background: rgba(239, 68, 68, 0.2);
+  color: var(--recording);
+}
+
+.status-badge.processing {
+  background: rgba(234, 179, 8, 0.2);
+  color: var(--warning);
+}
+
+.status-badge.success {
+  background: rgba(34, 197, 94, 0.2);
+  color: var(--success);
+}
+
+.status-badge.error {
+  background: rgba(239, 68, 68, 0.2);
+  color: var(--error);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.status-dot.recording {
+  animation: pulse 1s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(1.2); }
+}
+
+.main-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.record-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  padding: 14px;
+  border: none;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.record-button.idle {
+  background: var(--accent);
+  color: white;
+}
+
+.record-button.idle:hover {
+  background: #2563eb;
+}
+
+.record-button.recording {
+  background: var(--recording);
+  color: white;
+}
+
+.record-button.recording:hover {
+  background: #dc2626;
+}
+
+.record-button:disabled {
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.mic-icon {
+  font-size: 18px;
+}
+
+.shortcut-hint {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+kbd {
+  display: inline-block;
+  padding: 2px 6px;
+  background: var(--bg-secondary);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 10px;
+}
+
+.transcript-preview {
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  padding: 12px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.transcript-preview p {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.transcript-preview .label {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.error-message {
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--error);
+}
+
+.audio-level {
+  height: 4px;
+  background: var(--bg-secondary);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.audio-level-bar {
+  height: 100%;
+  background: var(--recording);
+  transition: width 0.05s ease;
+}
+
+.settings-section {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--bg-secondary);
+}
+
+.settings-section h3 {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 8px;
+}
+
+.api-key-input {
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--bg-secondary);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  font-family: monospace;
+}
+
+.api-key-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.api-key-input::placeholder {
+  color: var(--text-muted);
+}
+
+textarea.api-key-input {
+  line-height: 1.4;
+}
