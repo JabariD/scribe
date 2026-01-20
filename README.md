@@ -2,6 +2,10 @@
 
 Lightweight voice-to-text transcription for macOS. Press a hotkey, speak, get text in your clipboard.
 
+## Why
+
+I wanted something simple: hotkey → speak → clipboard. No subscriptions, no account, no bloat. Just my own API key.
+
 ## Features
 
 - **Global Hotkey**: `Cmd+Shift+Space` to start/stop recording
