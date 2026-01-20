@@ -13,30 +13,24 @@ I wanted something simple: hotkey → speak → clipboard. No subscriptions, no 
 - **Menubar App**: Lives in your system tray
 - **Auto-clipboard**: Transcriptions copied automatically
 
-## Setup
+## Install
 
-### Prerequisites
+### Option 1: Download (easiest)
+1. Download `Scribe-macos.zip` from [Releases](https://github.com/JabariD/scribe/releases)
+2. Unzip and drag `Scribe.app` to `/Applications`
 
-- Node.js 18+
-- Rust (install via [rustup](https://rustup.rs/))
-- Xcode Command Line Tools (`xcode-select --install`)
-
-### Installation
-
+### Option 2: Build from source
 ```bash
-cd ~/Documents/code/scribe
-
-# Install dependencies
+git clone https://github.com/JabariD/scribe.git
+cd scribe
 npm install
-
-# Run in development mode
-npm run tauri dev
-
-# Build for production
 npm run tauri build
+cp -r src-tauri/target/release/bundle/macos/Scribe.app /Applications/
 ```
 
-### First Run
+Requires: Node.js 18+, Rust, Xcode CLI tools
+
+## First Run
 
 1. Click the Scribe icon in your menubar (or run in dev mode)
 2. Enter your OpenAI API key (get one at [platform.openai.com](https://platform.openai.com))
