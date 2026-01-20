@@ -18,6 +18,7 @@ I wanted something simple: hotkey → speak → clipboard. No subscriptions, no 
 ### Option 1: Download (easiest)
 1. Download `Scribe-macos.zip` from [Releases](https://github.com/JabariD/scribe/releases)
 2. Unzip and drag `Scribe.app` to `/Applications`
+3. First launch: Right-click → Open (macOS blocks unsigned apps)
 
 ### Option 2: Build from source
 ```bash
