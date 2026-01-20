@@ -1,6 +1,6 @@
 # Scribe 🎙️
 
-Lightweight voice-to-text transcription for macOS. Press a hotkey, speak, get text in your clipboard.
+Lightweight voice-to-text transcription for **macOS only**. Press a hotkey, speak, get text in your clipboard.
 
 ## Why
 
