@@ -57,7 +57,7 @@ Requires: Node.js 18+, Rust, Xcode CLI tools
 - **Tauri** (Rust) - Native app shell
 - **React** + TypeScript - UI
 - **cpal** - Audio capture
-- **OpenAI `gpt-4o-mini-transcribe`** - Fast, accurate transcription with prompt support
+- **OpenAI Whisper** (`whisper-1`) - Pure transcription, no AI interpretation
 
 ## Permissions Required
 

@@ -305,10 +305,10 @@ async fn transcribe(
         .mime_str("audio/wav")
         .map_err(|e| e.to_string())?;
 
-    // Use gpt-4o-mini-transcribe: faster, better quality than whisper-1
-    // Supports streaming (future enhancement) and prompting
+    // Use whisper-1: pure transcription, no AI interpretation/responses
+    // gpt-4o-mini-transcribe can "respond" instead of transcribe
     let mut form = reqwest::multipart::Form::new()
-        .text("model", "gpt-4o-mini-transcribe")
+        .text("model", "whisper-1")
         .text("response_format", "text")
         .part("file", part);
 
