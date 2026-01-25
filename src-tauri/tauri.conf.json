@@ -43,7 +43,7 @@
       "identifier": "com.scribe.app",
       "longDescription": "",
       "macOS": {
-        "entitlements": null,
+        "entitlements": "Entitlements.plist",
         "exceptionDomain": "",
         "frameworks": [],
         "providerShortName": null,

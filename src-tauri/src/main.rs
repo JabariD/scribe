@@ -254,6 +254,13 @@ fn stop_recording(
         return Err("No audio recorded".into());
     }
 
+    // Check if audio is silent (likely microphone permission issue)
+    let sum: f32 = samples.iter().map(|s| s * s).sum();
+    let rms = (sum / samples.len() as f32).sqrt();
+    if rms < 0.001 {
+        return Err("No audio detected. Please check microphone permissions in System Settings → Privacy & Security → Microphone".into());
+    }
+
     // Generate filename with timestamp
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let filename = format!("{}.wav", timestamp);
