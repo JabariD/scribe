@@ -9,6 +9,7 @@ I wanted something simple: hotkey → speak → clipboard. No subscriptions, no 
 ## Features
 
 - **Global Hotkey**: `Cmd+Shift+Space` to start/stop recording
+- **Pause & Cancel**: Pause mid-recording or cancel with `Escape`
 - **OpenAI Whisper**: Fast, accurate transcription
 - **Menubar App**: Lives in your system tray
 - **Auto-clipboard**: Transcriptions copied automatically
@@ -16,8 +17,10 @@ I wanted something simple: hotkey → speak → clipboard. No subscriptions, no 
 ## Install
 
 ### Option 1: Download (easiest)
-1. Download `Scribe-macos.zip` from [Releases](https://github.com/JabariD/scribe/releases)
-2. Unzip and drag `Scribe.app` to `/Applications`
+1. Download from [Releases](https://github.com/JabariD/scribe/releases):
+   - `Scribe_X.X.X_aarch64.dmg` (recommended) or
+   - `Scribe_X.X.X_aarch64.zip`
+2. Open DMG and drag to Applications, or unzip and drag `Scribe.app` to `/Applications`
 3. First launch: Right-click → Open (macOS blocks unsigned apps)
 
 ### Option 2: Build from source
@@ -44,8 +47,9 @@ Requires: Node.js 18+, Rust, Xcode CLI tools
 | Action | Trigger |
 |--------|---------|
 | Toggle recording | `Cmd+Shift+Space` |
+| Cancel recording | `Escape` |
+| Pause/resume | Click ⏸️ button |
 | Show/hide window | Click tray icon |
-| Stop recording | Press hotkey again or click Stop |
 
 ## File Locations
 
