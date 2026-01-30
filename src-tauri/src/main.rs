@@ -1,38 +1,20 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod recording;
+
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use parking_lot::Mutex;
+use recording::RecordingState;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{
     CustomMenuItem, GlobalShortcutManager, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu,
     SystemTrayMenuItem,
 };
-
-// Global state for recording
-struct RecordingState {
-    is_recording: AtomicBool,
-    audio_level: Mutex<f32>,
-    samples: Mutex<Vec<f32>>,
-    sample_rate: Mutex<u32>,
-}
-
-impl Default for RecordingState {
-    fn default() -> Self {
-        Self {
-            is_recording: AtomicBool::new(false),
-            audio_level: Mutex::new(0.0),
-            samples: Mutex::new(Vec::new()),
-            sample_rate: Mutex::new(44100),
-        }
-    }
-}
 
 #[derive(Serialize, Deserialize, Default)]
 struct Config {
@@ -100,6 +82,8 @@ fn play_sound_internal(sound: &str) {
         "stop" => "/System/Library/Sounds/Tink.aiff", 
         "success" => "/System/Library/Sounds/Glass.aiff",
         "error" => "/System/Library/Sounds/Basso.aiff",
+        "cancel" => "/System/Library/Sounds/Funk.aiff",
+        "pause" => "/System/Library/Sounds/Morse.aiff",
         _ => "/System/Library/Sounds/Pop.aiff",
     };
     
@@ -135,13 +119,11 @@ fn start_recording(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<RecordingState>>,
 ) -> Result<(), String> {
-    if state.is_recording.load(Ordering::SeqCst) {
+    if state.is_active() {
         return Err("Already recording".into());
     }
 
-    // Clear previous samples
-    state.samples.lock().clear();
-    state.is_recording.store(true, Ordering::SeqCst);
+    state.start();
 
     // Show red dot in menu bar when recording
     app.tray_handle().set_title("🔴").ok();
@@ -170,17 +152,7 @@ fn start_recording(
                 .build_input_stream(
                     &config.into(),
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        if !state_for_callback.is_recording.load(Ordering::SeqCst) {
-                            return;
-                        }
-
-                        // Calculate audio level (RMS)
-                        let sum: f32 = data.iter().map(|s| s * s).sum();
-                        let rms = (sum / data.len() as f32).sqrt();
-                        *state_for_callback.audio_level.lock() = rms.min(1.0);
-
-                        // Store samples
-                        state_for_callback.samples.lock().extend_from_slice(data);
+                        state_for_callback.push_samples(data);
                     },
                     |err| eprintln!("Stream error: {}", err),
                     None,
@@ -190,20 +162,11 @@ fn start_recording(
                 .build_input_stream(
                     &config.into(),
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                        if !state_for_callback.is_recording.load(Ordering::SeqCst) {
-                            return;
-                        }
-
                         let float_data: Vec<f32> = data
                             .iter()
                             .map(|&s| s as f32 / i16::MAX as f32)
                             .collect();
-
-                        let sum: f32 = float_data.iter().map(|s| s * s).sum();
-                        let rms = (sum / float_data.len() as f32).sqrt();
-                        *state_for_callback.audio_level.lock() = rms.min(1.0);
-
-                        state_for_callback.samples.lock().extend(float_data);
+                        state_for_callback.push_samples(&float_data);
                     },
                     |err| eprintln!("Stream error: {}", err),
                     None,
@@ -215,7 +178,7 @@ fn start_recording(
         stream.play().expect("Failed to start recording");
 
         // Keep recording until stopped
-        while state_clone.is_recording.load(Ordering::SeqCst) {
+        while state_clone.is_active() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
@@ -227,7 +190,7 @@ fn start_recording(
 
 #[tauri::command]
 fn get_audio_level(state: tauri::State<'_, Arc<RecordingState>>) -> f32 {
-    *state.audio_level.lock()
+    state.get_audio_level()
 }
 
 #[tauri::command]
@@ -235,8 +198,7 @@ fn stop_recording(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<RecordingState>>,
 ) -> Result<String, String> {
-    state.is_recording.store(false, Ordering::SeqCst);
-    *state.audio_level.lock() = 0.0;
+    let samples = state.stop();
 
     // Remove red dot from menu bar
     app.tray_handle().set_title("").ok();
@@ -247,7 +209,6 @@ fn stop_recording(
     // Small delay to ensure stream is fully stopped
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    let samples = state.samples.lock().clone();
     let sample_rate = *state.sample_rate.lock();
 
     if samples.is_empty() {
@@ -285,6 +246,52 @@ fn stop_recording(
     writer.finalize().map_err(|e| e.to_string())?;
 
     Ok(filepath.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn cancel_recording(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<RecordingState>>,
+) -> Result<(), String> {
+    if !state.is_active() {
+        return Err("Not recording".into());
+    }
+
+    state.cancel();
+
+    // Remove indicator from menu bar
+    app.tray_handle().set_title("").ok();
+
+    // Play cancel sound (subtle)
+    play_sound_internal("cancel");
+
+    Ok(())
+}
+
+#[tauri::command]
+fn pause_recording(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<RecordingState>>,
+) -> Result<bool, String> {
+    if !state.is_active() {
+        return Err("Not recording".into());
+    }
+
+    let now_paused = state.toggle_pause();
+
+    // Update tray indicator
+    if now_paused {
+        app.tray_handle().set_title("⏸️").ok();
+    } else {
+        app.tray_handle().set_title("🔴").ok();
+    }
+
+    Ok(now_paused)
+}
+
+#[tauri::command]
+fn is_paused(state: tauri::State<'_, Arc<RecordingState>>) -> bool {
+    state.is_paused()
 }
 
 #[tauri::command]
@@ -372,6 +379,17 @@ fn main() {
                     }
                 })
                 .expect("Failed to register global shortcut");
+            
+            // Escape to cancel recording
+            let handle2 = app.handle();
+            app.global_shortcut_manager()
+                .register("Escape", move || {
+                    if let Some(window) = handle2.get_window("main") {
+                        window.emit("cancel-recording", ()).ok();
+                    }
+                })
+                .expect("Failed to register escape shortcut");
+            
             Ok(())
         })
         .on_system_tray_event(|app, event| match event {
@@ -404,6 +422,9 @@ fn main() {
             set_api_key,
             start_recording,
             stop_recording,
+            cancel_recording,
+            pause_recording,
+            is_paused,
             get_audio_level,
             transcribe,
             play_sound,

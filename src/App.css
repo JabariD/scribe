@@ -64,6 +64,11 @@ body {
   color: var(--recording);
 }
 
+.status-badge.paused {
+  background: rgba(234, 179, 8, 0.2);
+  color: var(--warning);
+}
+
 .status-badge.processing {
   background: rgba(234, 179, 8, 0.2);
   color: var(--warning);
@@ -90,6 +95,15 @@ body {
   animation: pulse 1s ease-in-out infinite;
 }
 
+.status-dot.paused {
+  animation: blink 1.5s ease-in-out infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.5; transform: scale(1.2); }
@@ -101,12 +115,17 @@ body {
   gap: 12px;
 }
 
+.button-row {
+  display: flex;
+  gap: 8px;
+}
+
 .record-button {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
-  width: 100%;
+  flex: 1;
   padding: 14px;
   border: none;
   border-radius: 10px;
@@ -134,10 +153,51 @@ body {
   background: #dc2626;
 }
 
+.record-button.paused {
+  background: var(--warning);
+  color: #1a1a1a;
+}
+
+.record-button.paused:hover {
+  background: #ca8a04;
+}
+
 .record-button:disabled {
   background: var(--bg-secondary);
   color: var(--text-muted);
   cursor: not-allowed;
+}
+
+.control-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border: none;
+  border-radius: 10px;
+  font-size: 16px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.pause-button {
+  background: var(--bg-secondary);
+  color: var(--text);
+}
+
+.pause-button:hover {
+  background: #3a3a3a;
+}
+
+.cancel-button {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--error);
+  font-weight: bold;
+}
+
+.cancel-button:hover {
+  background: rgba(239, 68, 68, 0.3);
 }
 
 .mic-icon {
@@ -199,6 +259,11 @@ kbd {
   height: 100%;
   background: var(--recording);
   transition: width 0.05s ease;
+}
+
+.audio-level-bar.paused {
+  background: var(--warning);
+  opacity: 0.5;
 }
 
 .settings-section {

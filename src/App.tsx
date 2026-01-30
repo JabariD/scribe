@@ -4,7 +4,7 @@ import { writeText } from '@tauri-apps/api/clipboard'
 import { sendNotification } from '@tauri-apps/api/notification'
 import { listen } from '@tauri-apps/api/event'
 
-type Status = 'idle' | 'recording' | 'processing' | 'success' | 'error'
+type Status = 'idle' | 'recording' | 'paused' | 'processing' | 'success' | 'error'
 
 // Default prompt for better technical term recognition
 const DEFAULT_PROMPT = `Technical terms: TypeScript, JavaScript, React, useState, useEffect, async, await, API, JSON, npm, git, GitHub, VS Code, macOS, iOS, Android`
@@ -78,7 +78,7 @@ function App() {
   }, [status, apiKey])
 
   const stopRecording = useCallback(async () => {
-    if (status !== 'recording') return
+    if (status !== 'recording' && status !== 'paused') return
 
     // Clear level polling
     if ((window as any).__levelInterval) {
@@ -137,9 +137,42 @@ function App() {
     }
   }, [status, apiKey, prompt])
 
+  const cancelRecording = useCallback(async () => {
+    if (status !== 'recording' && status !== 'paused') return
+
+    // Clear level polling
+    if ((window as any).__levelInterval) {
+      clearInterval((window as any).__levelInterval)
+    }
+    setAudioLevel(0)
+
+    try {
+      await invoke('cancel_recording')
+      setStatus('idle')
+      setError('')
+    } catch (e) {
+      console.error('Failed to cancel:', e)
+      setStatus('idle')
+    }
+  }, [status])
+
+  const togglePause = useCallback(async () => {
+    if (status !== 'recording' && status !== 'paused') return
+
+    try {
+      const isPaused = await invoke<boolean>('pause_recording')
+      setStatus(isPaused ? 'paused' : 'recording')
+      if (isPaused) {
+        setAudioLevel(0)
+      }
+    } catch (e) {
+      console.error('Failed to toggle pause:', e)
+    }
+  }, [status])
+
   // Toggle recording
   const toggleRecording = useCallback(() => {
-    if (status === 'recording') {
+    if (status === 'recording' || status === 'paused') {
       stopRecording()
     } else if (status === 'idle' || status === 'success' || status === 'error') {
       startRecording()
@@ -157,9 +190,21 @@ function App() {
     }
   }, [toggleRecording])
 
+  // Listen for cancel event from Rust backend (Escape key)
+  useEffect(() => {
+    const unlisten = listen('cancel-recording', () => {
+      cancelRecording()
+    })
+
+    return () => {
+      unlisten.then(f => f())
+    }
+  }, [cancelRecording])
+
   const statusLabels: Record<Status, string> = {
     idle: 'Ready',
     recording: 'Recording...',
+    paused: 'Paused',
     processing: 'Transcribing...',
     success: 'Copied!',
     error: 'Error',
@@ -168,6 +213,7 @@ function App() {
   const buttonLabels: Record<Status, string> = {
     idle: 'Start Recording',
     recording: 'Stop Recording',
+    paused: 'Stop Recording',
     processing: 'Processing...',
     success: 'Start Recording',
     error: 'Try Again',
@@ -184,26 +230,50 @@ function App() {
       </div>
 
       <div className="main-content">
-        {status === 'recording' && (
+        {(status === 'recording' || status === 'paused') && (
           <div className="audio-level">
             <div 
-              className="audio-level-bar" 
-              style={{ width: `${audioLevel * 100}%` }} 
+              className={`audio-level-bar ${status === 'paused' ? 'paused' : ''}`}
+              style={{ width: status === 'paused' ? '100%' : `${audioLevel * 100}%` }} 
             />
           </div>
         )}
 
-        <button
-          className={`record-button ${status === 'recording' ? 'recording' : 'idle'}`}
-          onClick={toggleRecording}
-          disabled={status === 'processing'}
-        >
-          <span className="mic-icon">{status === 'recording' ? '⏹️' : '🎤'}</span>
-          {buttonLabels[status]}
-        </button>
+        <div className="button-row">
+          <button
+            className={`record-button ${status === 'recording' ? 'recording' : status === 'paused' ? 'paused' : 'idle'}`}
+            onClick={toggleRecording}
+            disabled={status === 'processing'}
+          >
+            <span className="mic-icon">{status === 'recording' || status === 'paused' ? '⏹️' : '🎤'}</span>
+            {buttonLabels[status]}
+          </button>
+
+          {(status === 'recording' || status === 'paused') && (
+            <>
+              <button
+                className="control-button pause-button"
+                onClick={togglePause}
+                title={status === 'paused' ? 'Resume' : 'Pause'}
+              >
+                {status === 'paused' ? '▶️' : '⏸️'}
+              </button>
+              <button
+                className="control-button cancel-button"
+                onClick={cancelRecording}
+                title="Cancel (Esc)"
+              >
+                ✕
+              </button>
+            </>
+          )}
+        </div>
 
         <p className="shortcut-hint">
-          or press <kbd>⌘</kbd> + <kbd>⇧</kbd> + <kbd>Space</kbd>
+          {status === 'recording' || status === 'paused' 
+            ? <>Press <kbd>Esc</kbd> to cancel</>
+            : <>or press <kbd>⌘</kbd> + <kbd>⇧</kbd> + <kbd>Space</kbd></>
+          }
         </p>
 
         {transcript && (
