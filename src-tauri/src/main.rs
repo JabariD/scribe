@@ -115,6 +115,25 @@ fn set_api_key(api_key: String) {
 }
 
 #[tauri::command]
+fn register_escape_hotkey(app: tauri::AppHandle) -> Result<(), String> {
+    let handle = app.clone();
+    app.global_shortcut_manager()
+        .register("Escape", move || {
+            if let Some(window) = handle.get_window("main") {
+                window.emit("cancel-recording", ()).ok();
+            }
+        })
+        .map_err(|e| format!("Failed to register escape: {}", e))
+}
+
+#[tauri::command]
+fn unregister_escape_hotkey(app: tauri::AppHandle) -> Result<(), String> {
+    app.global_shortcut_manager()
+        .unregister("Escape")
+        .map_err(|e| format!("Failed to unregister escape: {}", e))
+}
+
+#[tauri::command]
 fn start_recording(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<RecordingState>>,
@@ -380,17 +399,7 @@ fn main() {
                 })
                 .expect("Failed to register global shortcut");
             
-            // Escape to cancel recording
-            let handle2 = app.handle();
-            app.global_shortcut_manager()
-                .register("Escape", move || {
-                    if let Some(window) = handle2.get_window("main") {
-                        window.emit("cancel-recording", ()).ok();
-                    }
-                })
-                .expect("Failed to register escape shortcut");
-            
-            Ok(())
+Ok(())
         })
         .on_system_tray_event(|app, event| match event {
             SystemTrayEvent::LeftClick { .. } => {
@@ -420,6 +429,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_api_key,
             set_api_key,
+            register_escape_hotkey,
+            unregister_escape_hotkey,
             start_recording,
             stop_recording,
             cancel_recording,

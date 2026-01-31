@@ -50,6 +50,8 @@ function App() {
     try {
       // Sound and tray icon handled by Rust backend
       await invoke('start_recording')
+      // Register Escape key only while recording
+      await invoke('register_escape_hotkey')
       
       // Poll audio level while recording
       const levelInterval = setInterval(async () => {
@@ -79,6 +81,9 @@ function App() {
 
   const stopRecording = useCallback(async () => {
     if (status !== 'recording' && status !== 'paused') return
+
+    // Unregister Escape key when done recording
+    invoke('unregister_escape_hotkey').catch(() => {})
 
     // Clear level polling
     if ((window as any).__levelInterval) {
@@ -139,6 +144,9 @@ function App() {
 
   const cancelRecording = useCallback(async () => {
     if (status !== 'recording' && status !== 'paused') return
+
+    // Unregister Escape key when done recording
+    invoke('unregister_escape_hotkey').catch(() => {})
 
     // Clear level polling
     if ((window as any).__levelInterval) {
