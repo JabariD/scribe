@@ -15,12 +15,16 @@ function App() {
   const [error, setError] = useState<string>('')
   const [audioLevel, setAudioLevel] = useState<number>(0)
   const [apiKey, setApiKey] = useState<string>('')
+  const [model, setModel] = useState<string>('whisper-1')
   const [prompt, setPrompt] = useState<string>(DEFAULT_PROMPT)
 
-  // Load saved API key on mount
+  // Load saved settings on mount
   useEffect(() => {
     invoke<string>('get_api_key').then(key => {
       if (key) setApiKey(key)
+    }).catch(() => {})
+    invoke<string>('get_model').then(m => {
+      if (m) setModel(m)
     }).catch(() => {})
   }, [])
 
@@ -31,6 +35,16 @@ function App() {
       await invoke('set_api_key', { apiKey: key })
     } catch (e) {
       console.error('Failed to save API key:', e)
+    }
+  }
+
+  // Save model when changed
+  const handleModelChange = async (m: string) => {
+    setModel(m)
+    try {
+      await invoke('set_model', { model: m })
+    } catch (e) {
+      console.error('Failed to save model:', e)
     }
   }
 
@@ -99,10 +113,10 @@ function App() {
       // Show processing indicator
       invoke('set_tray_status', { status: 'processing' })
       
-      // Transcribe with OpenAI (gpt-4o-mini-transcribe)
       const result = await invoke<string>('transcribe', { 
         audioPath,
         apiKey,
+        model: model || null,
         prompt: prompt || null,
       })
       
@@ -306,6 +320,20 @@ function App() {
             value={apiKey}
             onChange={(e) => handleApiKeyChange(e.target.value)}
           />
+        </div>
+
+        <div className="settings-section" style={{ marginTop: '12px', paddingTop: '12px' }}>
+          <h3>Model</h3>
+          <select
+            className="api-key-input"
+            value={model}
+            onChange={(e) => handleModelChange(e.target.value)}
+            style={{ cursor: 'pointer' }}
+          >
+            <option value="whisper-1">whisper-1 — $0.006/min, classic</option>
+            <option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe — $0.003/min, faster &amp; cheaper</option>
+            <option value="gpt-4o-transcribe">gpt-4o-transcribe — $0.006/min, best quality</option>
+          </select>
         </div>
 
         <div className="settings-section" style={{ marginTop: '12px', paddingTop: '12px' }}>

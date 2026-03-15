@@ -19,6 +19,7 @@ use tauri::{
 #[derive(Serialize, Deserialize, Default)]
 struct Config {
     api_key: Option<String>,
+    model: Option<String>,
 }
 
 fn get_config_path() -> PathBuf {
@@ -111,6 +112,18 @@ fn get_api_key() -> String {
 fn set_api_key(api_key: String) {
     let mut config = load_config();
     config.api_key = Some(api_key);
+    save_config(&config);
+}
+
+#[tauri::command]
+fn get_model() -> String {
+    load_config().model.unwrap_or_else(|| "whisper-1".to_string())
+}
+
+#[tauri::command]
+fn set_model(model: String) {
+    let mut config = load_config();
+    config.model = Some(model);
     save_config(&config);
 }
 
@@ -317,6 +330,7 @@ fn is_paused(state: tauri::State<'_, Arc<RecordingState>>) -> bool {
 async fn transcribe(
     audio_path: String,
     api_key: String,
+    model: Option<String>,
     prompt: Option<String>,
 ) -> Result<String, String> {
     let client = reqwest::Client::new();
@@ -338,10 +352,15 @@ async fn transcribe(
         .mime_str("audio/wav")
         .map_err(|e| e.to_string())?;
 
-    // Use whisper-1: pure transcription, no AI interpretation/responses
-    // gpt-4o-mini-transcribe can "respond" instead of transcribe
+    // Validate model — only allow known transcription models
+    let selected_model = match model.as_deref().unwrap_or("whisper-1") {
+        "gpt-4o-transcribe" => "gpt-4o-transcribe",
+        "gpt-4o-mini-transcribe" => "gpt-4o-mini-transcribe",
+        _ => "whisper-1",
+    };
+
     let mut form = reqwest::multipart::Form::new()
-        .text("model", "whisper-1")
+        .text("model", selected_model)
         .text("response_format", "text")
         .part("file", part);
 
@@ -429,6 +448,8 @@ Ok(())
         .invoke_handler(tauri::generate_handler![
             get_api_key,
             set_api_key,
+            get_model,
+            set_model,
             register_escape_hotkey,
             unregister_escape_hotkey,
             start_recording,
