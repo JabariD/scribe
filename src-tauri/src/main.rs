@@ -20,6 +20,7 @@ use tauri::{
 struct Config {
     api_key: Option<String>,
     model: Option<String>,
+    show_recording_overlay: Option<bool>,
 }
 
 fn get_config_path() -> PathBuf {
@@ -124,6 +125,18 @@ fn get_model() -> String {
 fn set_model(model: String) {
     let mut config = load_config();
     config.model = Some(model);
+    save_config(&config);
+}
+
+#[tauri::command]
+fn get_show_recording_overlay() -> bool {
+    load_config().show_recording_overlay.unwrap_or(true)
+}
+
+#[tauri::command]
+fn set_show_recording_overlay(show_recording_overlay: bool) {
+    let mut config = load_config();
+    config.show_recording_overlay = Some(show_recording_overlay);
     save_config(&config);
 }
 
@@ -452,6 +465,8 @@ Ok(())
             set_api_key,
             get_model,
             set_model,
+            get_show_recording_overlay,
+            set_show_recording_overlay,
             register_escape_hotkey,
             unregister_escape_hotkey,
             start_recording,

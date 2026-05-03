@@ -68,6 +68,7 @@ function App() {
   const [waveform, setWaveform] = useState<number[]>(() => createWaveform(0))
   const [apiKey, setApiKey] = useState<string>('')
   const [model, setModel] = useState<string>('whisper-1')
+  const [showRecordingOverlay, setShowRecordingOverlay] = useState<boolean>(true)
   const [prompt, setPrompt] = useState<string>(DEFAULT_PROMPT)
 
   const levelIntervalRef = useRef<number | null>(null)
@@ -170,6 +171,10 @@ function App() {
     invoke<string>('get_model').then((savedModel) => {
       if (savedModel) setModel(savedModel)
     }).catch(() => {})
+
+    invoke<boolean>('get_show_recording_overlay').then((savedPreference) => {
+      setShowRecordingOverlay(savedPreference)
+    }).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -197,6 +202,15 @@ function App() {
     }
   }
 
+  const handleShowRecordingOverlayChange = async (enabled: boolean) => {
+    setShowRecordingOverlay(enabled)
+    try {
+      await invoke('set_show_recording_overlay', { showRecordingOverlay: enabled })
+    } catch (saveError) {
+      console.error('Failed to save overlay preference:', saveError)
+    }
+  }
+
   const startRecording = useCallback(async () => {
     if (status === 'recording') return
 
@@ -219,7 +233,11 @@ function App() {
       await invoke('start_recording')
       await invoke('register_escape_hotkey')
       setStatus('recording')
-      await showOverlayWindow()
+      if (showRecordingOverlay) {
+        await showOverlayWindow()
+      } else {
+        await hideWindow()
+      }
       startAudioPolling()
     } catch (recordingError) {
       const message = `Failed to start recording: ${recordingError}`
@@ -229,7 +247,7 @@ function App() {
       invoke('play_sound', { sound: 'error' }).catch(() => {})
       await showSettingsWindow()
     }
-  }, [apiKey, clearHideTimer, resetWaveform, showOverlayWindow, showSettingsWindow, startAudioPolling, status])
+  }, [apiKey, clearHideTimer, hideWindow, resetWaveform, showOverlayWindow, showRecordingOverlay, showSettingsWindow, startAudioPolling, status])
 
   const stopRecording = useCallback(async () => {
     if (!isRecordingStatus(status)) return
@@ -241,7 +259,9 @@ function App() {
     setStatus('processing')
 
     try {
-      await showOverlayWindow()
+      if (showRecordingOverlay) {
+        await showOverlayWindow()
+      }
 
       const audioPath = await invoke<string>('stop_recording')
       await invoke('set_tray_status', { status: 'processing' })
@@ -274,12 +294,18 @@ function App() {
 
       if (shouldShowSettingsForError(message)) {
         await showSettingsWindow()
-      } else {
+      } else if (showRecordingOverlay) {
         await showOverlayWindow()
+        scheduleHide(5000)
+      } else {
+        await sendNotification({
+          title: 'Scribe',
+          body: message,
+        })
         scheduleHide(5000)
       }
     }
-  }, [apiKey, clearHideTimer, clearLevelPolling, model, prompt, scheduleHide, showOverlayWindow, showSettingsWindow, status])
+  }, [apiKey, clearHideTimer, clearLevelPolling, model, prompt, scheduleHide, showOverlayWindow, showRecordingOverlay, showSettingsWindow, status])
 
   const cancelRecording = useCallback(async () => {
     if (!isRecordingStatus(status)) return
@@ -354,6 +380,14 @@ function App() {
       unlisten.then((dispose) => dispose())
     }
   }, [showSettingsWindow])
+
+  useEffect(() => {
+    if (showRecordingOverlay || viewMode !== 'overlay' || status === 'error') return
+
+    hideWindow().catch((windowError) => {
+      console.error('Failed to hide overlay window:', windowError)
+    })
+  }, [hideWindow, showRecordingOverlay, status, viewMode])
 
   const statusLabels: Record<Status, string> = {
     idle: 'Ready',
@@ -541,6 +575,21 @@ function App() {
         </div>
 
         <div className="settings-section compact-top-gap">
+          <h3>Recording HUD</h3>
+          <label className="checkbox-setting">
+            <input
+              type="checkbox"
+              checked={showRecordingOverlay}
+              onChange={(event) => handleShowRecordingOverlayChange(event.target.checked)}
+            />
+            <span>
+              <strong>Show recording overlay</strong>
+              <small>When off, dictation stays minimized unless Scribe needs your attention.</small>
+            </span>
+          </label>
+        </div>
+
+        <div className="settings-section compact-top-gap">
           <h3>Vocabulary Hints</h3>
           <textarea
             className="api-key-input vocabulary-input"
@@ -554,7 +603,7 @@ function App() {
     </div>
   )
 
-  return viewMode === 'overlay' && status !== 'idle' ? renderOverlay() : renderSettings()
+  return showRecordingOverlay && viewMode === 'overlay' && status !== 'idle' ? renderOverlay() : renderSettings()
 }
 
 export default App

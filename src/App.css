@@ -372,6 +372,36 @@ kbd {
   color: #666;
 }
 
+.checkbox-setting {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.checkbox-setting input {
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+}
+
+.checkbox-setting span {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.checkbox-setting strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.checkbox-setting small {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .app.overlay {
   min-width: 100%;
   min-height: 100vh;
