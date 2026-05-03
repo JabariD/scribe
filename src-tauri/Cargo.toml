@@ -1,6 +1,6 @@
 [package]
 name = "scribe"
-version = "0.2.2"
+version = "0.3.0"
 description = "Voice-to-text transcription app"
 authors = ["Payton Dennis"]
 license = "MIT"
