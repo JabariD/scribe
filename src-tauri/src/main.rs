@@ -426,6 +426,7 @@ Ok(())
                     if window.is_visible().unwrap_or(false) {
                         window.hide().ok();
                     } else {
+                        window.emit("show-settings", ()).ok();
                         window.show().ok();
                         window.set_focus().ok();
                     }
@@ -434,6 +435,7 @@ Ok(())
             SystemTrayEvent::MenuItemClick { id, .. } => match id.as_str() {
                 "show" => {
                     if let Some(window) = app.get_window("main") {
+                        window.emit("show-settings", ()).ok();
                         window.show().ok();
                         window.set_focus().ok();
                     }

@@ -1,227 +1,359 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { invoke } from '@tauri-apps/api/tauri'
 import { writeText } from '@tauri-apps/api/clipboard'
 import { sendNotification } from '@tauri-apps/api/notification'
 import { listen } from '@tauri-apps/api/event'
+import { appWindow, LogicalPosition, LogicalSize } from '@tauri-apps/api/window'
 
 type Status = 'idle' | 'recording' | 'paused' | 'processing' | 'success' | 'error'
+type ViewMode = 'settings' | 'overlay'
 
-// Default prompt for better technical term recognition
 const DEFAULT_PROMPT = `Technical terms: TypeScript, JavaScript, React, useState, useEffect, async, await, API, JSON, npm, git, GitHub, VS Code, macOS, iOS, Android`
+const SETTINGS_WINDOW_SIZE = { width: 320, height: 520 }
+const OVERLAY_WINDOW_SIZE = { width: 760, height: 190 }
+const WAVEFORM_BAR_COUNT = 56
+const BASE_WAVEFORM_LEVEL = 0.08
+
+function normalizeAudioLevel(level: number) {
+  return Math.min(1, Math.pow(Math.max(level, 0) * 24, 0.6))
+}
+
+function createWaveform(level = 0, frame = 0) {
+  const normalized = normalizeAudioLevel(level)
+  const center = (WAVEFORM_BAR_COUNT - 1) / 2
+
+  return Array.from({ length: WAVEFORM_BAR_COUNT }, (_, index) => {
+    const distanceFromCenter = Math.abs(index - center) / center
+    const envelope = Math.pow(1 - distanceFromCenter, 1.35)
+    const primaryPulse = (Math.sin(frame * 0.55 + index * 0.72) + 1) / 2
+    const secondaryPulse = (Math.sin(frame * 0.24 + index * 0.31 + 1.4) + 1) / 2
+    const shimmer = primaryPulse * 0.7 + secondaryPulse * 0.3
+    const levelWithEnvelope = normalized * (0.22 + envelope * 0.78)
+    const animatedLevel = levelWithEnvelope * (0.35 + shimmer * 0.65)
+
+    return Math.min(1, BASE_WAVEFORM_LEVEL + animatedLevel)
+  })
+}
+
+function isRecordingStatus(status: Status) {
+  return status === 'recording' || status === 'paused'
+}
+
+function shouldShowSettingsForError(message: string) {
+  const normalized = message.toLowerCase()
+  return (
+    normalized.includes('api key') ||
+    normalized.includes('microphone') ||
+    normalized.includes('permission') ||
+    normalized.includes('no audio detected')
+  )
+}
+
+function ShortcutKeys({ keys }: { keys: string[] }) {
+  return (
+    <span className="shortcut-group" aria-hidden="true">
+      {keys.map((key) => (
+        <kbd key={key}>{key}</kbd>
+      ))}
+    </span>
+  )
+}
 
 function App() {
   const [status, setStatus] = useState<Status>('idle')
+  const [viewMode, setViewMode] = useState<ViewMode>('settings')
   const [transcript, setTranscript] = useState<string>('')
   const [error, setError] = useState<string>('')
   const [audioLevel, setAudioLevel] = useState<number>(0)
+  const [waveform, setWaveform] = useState<number[]>(() => createWaveform(0))
   const [apiKey, setApiKey] = useState<string>('')
   const [model, setModel] = useState<string>('whisper-1')
   const [prompt, setPrompt] = useState<string>(DEFAULT_PROMPT)
 
-  // Load saved settings on mount
+  const levelIntervalRef = useRef<number | null>(null)
+  const hideTimerRef = useRef<number | null>(null)
+  const waveformFrameRef = useRef(0)
+
+  const clearLevelPolling = useCallback(() => {
+    if (levelIntervalRef.current !== null) {
+      window.clearInterval(levelIntervalRef.current)
+      levelIntervalRef.current = null
+    }
+  }, [])
+
+  const clearHideTimer = useCallback(() => {
+    if (hideTimerRef.current !== null) {
+      window.clearTimeout(hideTimerRef.current)
+      hideTimerRef.current = null
+    }
+  }, [])
+
+  const resetWaveform = useCallback((level = 0) => {
+    waveformFrameRef.current = 0
+    setWaveform(createWaveform(level, waveformFrameRef.current))
+  }, [])
+
+  const pushWaveformLevel = useCallback((level: number) => {
+    waveformFrameRef.current += 1
+    setWaveform(createWaveform(level, waveformFrameRef.current))
+  }, [])
+
+  const hideWindow = useCallback(async () => {
+    await appWindow.setAlwaysOnTop(false)
+    await appWindow.hide()
+  }, [])
+
+  const showOverlayWindow = useCallback(async () => {
+    setViewMode('overlay')
+
+    const screenWidth = window.screen.availWidth || window.screen.width || OVERLAY_WINDOW_SIZE.width
+    const screenTop = (window.screen as Screen & { availTop?: number }).availTop ?? 0
+    const x = Math.max(0, Math.round((screenWidth - OVERLAY_WINDOW_SIZE.width) / 2))
+    const y = Math.max(24, screenTop + 24)
+
+    await appWindow.setSize(new LogicalSize(OVERLAY_WINDOW_SIZE.width, OVERLAY_WINDOW_SIZE.height))
+    await appWindow.setPosition(new LogicalPosition(x, y))
+    await appWindow.setAlwaysOnTop(true)
+    await appWindow.show()
+  }, [])
+
+  const showSettingsWindow = useCallback(async () => {
+    clearHideTimer()
+    setViewMode('settings')
+
+    await appWindow.setAlwaysOnTop(false)
+    await appWindow.setSize(new LogicalSize(SETTINGS_WINDOW_SIZE.width, SETTINGS_WINDOW_SIZE.height))
+    await appWindow.center()
+    await appWindow.show()
+    await appWindow.setFocus()
+  }, [clearHideTimer])
+
+  const returnToIdleAndHide = useCallback(async () => {
+    clearHideTimer()
+    clearLevelPolling()
+    setStatus('idle')
+    setViewMode('settings')
+    setAudioLevel(0)
+    resetWaveform()
+    await invoke('set_tray_status', { status: 'idle' })
+    await hideWindow()
+  }, [clearHideTimer, clearLevelPolling, hideWindow, resetWaveform])
+
+  const scheduleHide = useCallback((delayMs: number) => {
+    clearHideTimer()
+    hideTimerRef.current = window.setTimeout(() => {
+      returnToIdleAndHide().catch((hideError) => {
+        console.error('Failed to hide window:', hideError)
+      })
+    }, delayMs)
+  }, [clearHideTimer, returnToIdleAndHide])
+
+  const startAudioPolling = useCallback(() => {
+    clearLevelPolling()
+
+    levelIntervalRef.current = window.setInterval(async () => {
+      try {
+        const level = await invoke<number>('get_audio_level')
+        setAudioLevel(level)
+        pushWaveformLevel(level)
+      } catch {
+        clearLevelPolling()
+      }
+    }, 50)
+  }, [clearLevelPolling, pushWaveformLevel])
+
   useEffect(() => {
-    invoke<string>('get_api_key').then(key => {
+    invoke<string>('get_api_key').then((key) => {
       if (key) setApiKey(key)
     }).catch(() => {})
-    invoke<string>('get_model').then(m => {
-      if (m) setModel(m)
+
+    invoke<string>('get_model').then((savedModel) => {
+      if (savedModel) setModel(savedModel)
     }).catch(() => {})
   }, [])
 
-  // Save API key when changed
+  useEffect(() => {
+    return () => {
+      clearLevelPolling()
+      clearHideTimer()
+    }
+  }, [clearHideTimer, clearLevelPolling])
+
   const handleApiKeyChange = async (key: string) => {
     setApiKey(key)
     try {
       await invoke('set_api_key', { apiKey: key })
-    } catch (e) {
-      console.error('Failed to save API key:', e)
+    } catch (saveError) {
+      console.error('Failed to save API key:', saveError)
     }
   }
 
-  // Save model when changed
-  const handleModelChange = async (m: string) => {
-    setModel(m)
+  const handleModelChange = async (nextModel: string) => {
+    setModel(nextModel)
     try {
-      await invoke('set_model', { model: m })
-    } catch (e) {
-      console.error('Failed to save model:', e)
+      await invoke('set_model', { model: nextModel })
+    } catch (saveError) {
+      console.error('Failed to save model:', saveError)
     }
   }
 
   const startRecording = useCallback(async () => {
     if (status === 'recording') return
+
+    clearHideTimer()
+
     if (!apiKey) {
       setError('Please enter your OpenAI API key first')
       setStatus('error')
-      invoke('play_sound', { sound: 'error' })
+      await showSettingsWindow()
+      invoke('play_sound', { sound: 'error' }).catch(() => {})
       return
     }
 
-    setStatus('recording')
     setError('')
     setTranscript('')
+    setAudioLevel(0)
+    resetWaveform()
 
     try {
-      // Sound and tray icon handled by Rust backend
       await invoke('start_recording')
-      // Register Escape key only while recording
       await invoke('register_escape_hotkey')
-      
-      // Poll audio level while recording
-      const levelInterval = setInterval(async () => {
-        try {
-          const level = await invoke<number>('get_audio_level')
-          setAudioLevel(level)
-        } catch {
-          clearInterval(levelInterval)
-        }
-      }, 50)
-
-      // Store interval ID for cleanup
-      ;(window as any).__levelInterval = levelInterval
-    } catch (e) {
-      setError(`Failed to start recording: ${e}`)
+      setStatus('recording')
+      await showOverlayWindow()
+      startAudioPolling()
+    } catch (recordingError) {
+      const message = `Failed to start recording: ${recordingError}`
+      setError(message)
       setStatus('error')
-      invoke('set_tray_status', { status: 'error' })
-      invoke('play_sound', { sound: 'error' })
-      
-      // Reset to idle after 5 seconds
-      setTimeout(() => {
-        setStatus('idle')
-        invoke('set_tray_status', { status: 'idle' })
-      }, 5000)
+      invoke('set_tray_status', { status: 'error' }).catch(() => {})
+      invoke('play_sound', { sound: 'error' }).catch(() => {})
+      await showSettingsWindow()
     }
-  }, [status, apiKey])
+  }, [apiKey, clearHideTimer, resetWaveform, showOverlayWindow, showSettingsWindow, startAudioPolling, status])
 
   const stopRecording = useCallback(async () => {
-    if (status !== 'recording' && status !== 'paused') return
+    if (!isRecordingStatus(status)) return
 
-    // Unregister Escape key when done recording
+    clearHideTimer()
     invoke('unregister_escape_hotkey').catch(() => {})
-
-    // Clear level polling
-    if ((window as any).__levelInterval) {
-      clearInterval((window as any).__levelInterval)
-    }
+    clearLevelPolling()
     setAudioLevel(0)
     setStatus('processing')
 
     try {
-      // Stop recording and get audio path (tray shows ⏳)
+      await showOverlayWindow()
+
       const audioPath = await invoke<string>('stop_recording')
-      
-      // Show processing indicator
-      invoke('set_tray_status', { status: 'processing' })
-      
-      const result = await invoke<string>('transcribe', { 
+      await invoke('set_tray_status', { status: 'processing' })
+
+      const result = await invoke<string>('transcribe', {
         audioPath,
         apiKey,
         model: model || null,
         prompt: prompt || null,
       })
-      
+
       setTranscript(result)
-      
-      // Copy to clipboard
       await writeText(result)
-      
-      // Show success indicator and play sound
-      invoke('set_tray_status', { status: 'success' })
-      invoke('play_sound', { sound: 'success' })
-      
-      // Show notification
+      await invoke('set_tray_status', { status: 'success' })
+      invoke('play_sound', { sound: 'success' }).catch(() => {})
+
       await sendNotification({
         title: 'Scribe',
-        body: '✅ Copied to clipboard',
+        body: 'Copied to clipboard',
       })
-      
+
       setStatus('success')
-      
-      // Reset to idle after 3 seconds
-      setTimeout(() => {
-        setStatus('idle')
-        invoke('set_tray_status', { status: 'idle' })
-      }, 3000)
-    } catch (e) {
-      setError(`${e}`)
+      scheduleHide(1800)
+    } catch (stopError) {
+      const message = `${stopError}`
+      setError(message)
       setStatus('error')
-      invoke('set_tray_status', { status: 'error' })
-      invoke('play_sound', { sound: 'error' })
-      
-      // Reset to idle after 5 seconds
-      setTimeout(() => {
-        setStatus('idle')
-        invoke('set_tray_status', { status: 'idle' })
-      }, 5000)
+      await invoke('set_tray_status', { status: 'error' })
+      invoke('play_sound', { sound: 'error' }).catch(() => {})
+
+      if (shouldShowSettingsForError(message)) {
+        await showSettingsWindow()
+      } else {
+        await showOverlayWindow()
+        scheduleHide(5000)
+      }
     }
-  }, [status, apiKey, prompt])
+  }, [apiKey, clearHideTimer, clearLevelPolling, model, prompt, scheduleHide, showOverlayWindow, showSettingsWindow, status])
 
   const cancelRecording = useCallback(async () => {
-    if (status !== 'recording' && status !== 'paused') return
+    if (!isRecordingStatus(status)) return
 
-    // Unregister Escape key when done recording
+    clearHideTimer()
     invoke('unregister_escape_hotkey').catch(() => {})
-
-    // Clear level polling
-    if ((window as any).__levelInterval) {
-      clearInterval((window as any).__levelInterval)
-    }
+    clearLevelPolling()
     setAudioLevel(0)
+    resetWaveform()
 
     try {
       await invoke('cancel_recording')
-      setStatus('idle')
-      setError('')
-    } catch (e) {
-      console.error('Failed to cancel:', e)
-      setStatus('idle')
+    } catch (cancelError) {
+      console.error('Failed to cancel recording:', cancelError)
     }
-  }, [status])
+
+    setError('')
+    setStatus('idle')
+    setViewMode('settings')
+    await hideWindow()
+  }, [clearHideTimer, clearLevelPolling, hideWindow, resetWaveform, status])
 
   const togglePause = useCallback(async () => {
-    if (status !== 'recording' && status !== 'paused') return
+    if (!isRecordingStatus(status)) return
 
     try {
-      const isPaused = await invoke<boolean>('pause_recording')
-      setStatus(isPaused ? 'paused' : 'recording')
-      if (isPaused) {
+      const paused = await invoke<boolean>('pause_recording')
+      setStatus(paused ? 'paused' : 'recording')
+      if (paused) {
         setAudioLevel(0)
+        resetWaveform(0)
       }
-    } catch (e) {
-      console.error('Failed to toggle pause:', e)
+    } catch (pauseError) {
+      console.error('Failed to toggle pause:', pauseError)
     }
-  }, [status])
+  }, [resetWaveform, status])
 
-  // Toggle recording
   const toggleRecording = useCallback(() => {
-    if (status === 'recording' || status === 'paused') {
+    if (isRecordingStatus(status)) {
       stopRecording()
     } else if (status === 'idle' || status === 'success' || status === 'error') {
       startRecording()
     }
-  }, [status, startRecording, stopRecording])
+  }, [startRecording, status, stopRecording])
 
-  // Listen for toggle event from Rust backend (global shortcut)
   useEffect(() => {
     const unlisten = listen('toggle-recording', () => {
       toggleRecording()
     })
 
     return () => {
-      unlisten.then(f => f())
+      unlisten.then((dispose) => dispose())
     }
   }, [toggleRecording])
 
-  // Listen for cancel event from Rust backend (Escape key)
   useEffect(() => {
     const unlisten = listen('cancel-recording', () => {
       cancelRecording()
     })
 
     return () => {
-      unlisten.then(f => f())
+      unlisten.then((dispose) => dispose())
     }
   }, [cancelRecording])
+
+  useEffect(() => {
+    const unlisten = listen('show-settings', () => {
+      showSettingsWindow()
+    })
+
+    return () => {
+      unlisten.then((dispose) => dispose())
+    }
+  }, [showSettingsWindow])
 
   const statusLabels: Record<Status, string> = {
     idle: 'Ready',
@@ -241,8 +373,81 @@ function App() {
     error: 'Try Again',
   }
 
-  return (
-    <div className="app">
+  const overlayStatusText: Record<Exclude<Status, 'idle'>, string> = {
+    recording: 'Recording',
+    paused: 'Paused',
+    processing: 'Transcribing…',
+    success: 'Copied to clipboard',
+    error: 'Something went wrong',
+  }
+
+  const renderOverlay = () => {
+    const overlayState = status === 'idle' ? 'recording' : status
+
+    return (
+      <div className={`app overlay ${overlayState}`}>
+        <div className={`overlay-card ${overlayState}`}>
+          <div className={`overlay-waveform ${overlayState}`} data-tauri-drag-region>
+            {waveform.map((level, index) => (
+              <span
+                key={index}
+                className="waveform-bar"
+                style={{ height: `${Math.max(8, Math.round(level * 56))}px` }}
+              />
+            ))}
+          </div>
+
+          <div className="overlay-footer">
+            <div className="overlay-status" data-tauri-drag-region>
+              <span className={`overlay-status-dot ${overlayState}`} />
+              <span className="overlay-status-text">
+                {overlayStatusText[overlayState as Exclude<Status, 'idle'>]}
+              </span>
+            </div>
+
+            <div className="overlay-actions">
+              {isRecordingStatus(status) && (
+                <>
+                  <button className="overlay-action primary" onClick={stopRecording}>
+                    <span>Stop</span>
+                    <ShortcutKeys keys={['⌘', '⇧', 'Space']} />
+                  </button>
+
+                  <button
+                    className="overlay-icon-action"
+                    onClick={togglePause}
+                    title={status === 'paused' ? 'Resume' : 'Pause'}
+                  >
+                    {status === 'paused' ? '▶' : '❚❚'}
+                  </button>
+
+                  <button className="overlay-action" onClick={cancelRecording}>
+                    <span>Cancel</span>
+                    <ShortcutKeys keys={['Esc']} />
+                  </button>
+                </>
+              )}
+
+              {status === 'processing' && (
+                <div className="overlay-message">Working on the transcript…</div>
+              )}
+
+              {status === 'success' && (
+                <div className="overlay-message success">Ready to paste</div>
+              )}
+
+              {status === 'error' && (
+                <div className="overlay-message error">{error}</div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  const renderSettings = () => (
+    <div className="app settings">
       <div className="header" data-tauri-drag-region>
         <h1>🎙️ Scribe</h1>
         <span className={`status-badge ${status}`}>
@@ -252,11 +457,11 @@ function App() {
       </div>
 
       <div className="main-content">
-        {(status === 'recording' || status === 'paused') && (
+        {isRecordingStatus(status) && (
           <div className="audio-level">
-            <div 
+            <div
               className={`audio-level-bar ${status === 'paused' ? 'paused' : ''}`}
-              style={{ width: status === 'paused' ? '100%' : `${audioLevel * 100}%` }} 
+              style={{ width: status === 'paused' ? '100%' : `${audioLevel * 100}%` }}
             />
           </div>
         )}
@@ -267,11 +472,11 @@ function App() {
             onClick={toggleRecording}
             disabled={status === 'processing'}
           >
-            <span className="mic-icon">{status === 'recording' || status === 'paused' ? '⏹️' : '🎤'}</span>
+            <span className="mic-icon">{isRecordingStatus(status) ? '⏹️' : '🎤'}</span>
             {buttonLabels[status]}
           </button>
 
-          {(status === 'recording' || status === 'paused') && (
+          {isRecordingStatus(status) && (
             <>
               <button
                 className="control-button pause-button"
@@ -292,10 +497,9 @@ function App() {
         </div>
 
         <p className="shortcut-hint">
-          {status === 'recording' || status === 'paused' 
+          {isRecordingStatus(status)
             ? <>Press <kbd>Esc</kbd> to cancel</>
-            : <>or press <kbd>⌘</kbd> + <kbd>⇧</kbd> + <kbd>Space</kbd></>
-          }
+            : <>or press <kbd>⌘</kbd> + <kbd>⇧</kbd> + <kbd>Space</kbd></>}
         </p>
 
         {transcript && (
@@ -318,16 +522,16 @@ function App() {
             className="api-key-input"
             placeholder="sk-..."
             value={apiKey}
-            onChange={(e) => handleApiKeyChange(e.target.value)}
+            onChange={(event) => handleApiKeyChange(event.target.value)}
           />
         </div>
 
-        <div className="settings-section" style={{ marginTop: '12px', paddingTop: '12px' }}>
+        <div className="settings-section compact-top-gap">
           <h3>Model</h3>
           <select
             className="api-key-input"
             value={model}
-            onChange={(e) => handleModelChange(e.target.value)}
+            onChange={(event) => handleModelChange(event.target.value)}
             style={{ cursor: 'pointer' }}
           >
             <option value="whisper-1">whisper-1 — $0.006/min, classic</option>
@@ -336,27 +540,21 @@ function App() {
           </select>
         </div>
 
-        <div className="settings-section" style={{ marginTop: '12px', paddingTop: '12px' }}>
+        <div className="settings-section compact-top-gap">
           <h3>Vocabulary Hints</h3>
           <textarea
-            className="api-key-input"
+            className="api-key-input vocabulary-input"
             placeholder="Technical terms, names, acronyms..."
             value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            style={{ 
-              minHeight: '60px', 
-              resize: 'vertical',
-              fontFamily: 'inherit',
-              fontSize: '12px',
-            }}
+            onChange={(event) => setPrompt(event.target.value)}
           />
-          <p style={{ fontSize: '10px', color: '#666', marginTop: '4px' }}>
-            Add terms the model should recognize correctly
-          </p>
+          <p className="settings-note">Add terms the model should recognize correctly</p>
         </div>
       </div>
     </div>
   )
+
+  return viewMode === 'overlay' && status !== 'idle' ? renderOverlay() : renderSettings()
 }
 
 export default App
