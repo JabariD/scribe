@@ -54,7 +54,8 @@ Requires: Node.js 18+, Rust, Xcode CLI tools
 ## File Locations
 
 - **Audio recordings**: `~/Library/VoiceTranscripts/`
-- **Config (API key)**: `~/Library/Application Support/scribe/config.json`
+- **API key**: macOS Keychain
+- **Config**: `~/Library/Application Support/scribe/config.json`
 
 ## Tech Stack
 

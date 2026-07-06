@@ -5,12 +5,14 @@ mod recording;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use recording::RecordingState;
+use security_framework::os::macos::keychain::SecKeychain;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 use tauri::{
     CustomMenuItem, GlobalShortcutManager, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu,
     SystemTrayMenuItem,
@@ -18,10 +20,15 @@ use tauri::{
 
 #[derive(Serialize, Deserialize, Default)]
 struct Config {
-    api_key: Option<String>,
+    api_key: Option<String>, // legacy; migrated to macOS Keychain on read
     model: Option<String>,
     show_recording_overlay: Option<bool>,
+    prompt: Option<String>,
 }
+
+const KEYCHAIN_SERVICE: &str = "com.scribe.app";
+const KEYCHAIN_ACCOUNT_OPENAI_API_KEY: &str = "openai-api-key";
+const MAX_RECORDING_DURATION: Duration = Duration::from_secs(10 * 60);
 
 fn get_config_path() -> PathBuf {
     let config_dir = dirs::config_dir()
@@ -59,9 +66,60 @@ fn get_transcripts_dir() -> PathBuf {
     dir
 }
 
-// Icons embedded at compile time
-const ICON_NORMAL: &[u8] = include_bytes!("../icons/icon.png");
-const ICON_RECORDING: &[u8] = include_bytes!("../icons/icon-recording.png");
+fn get_api_key_from_keychain() -> Option<String> {
+    let keychain = SecKeychain::default().ok()?;
+    let (password, _) = keychain
+        .find_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_OPENAI_API_KEY)
+        .ok()?;
+    String::from_utf8(password.as_ref().to_vec()).ok()
+}
+
+fn set_api_key_in_keychain(api_key: &str) -> Result<(), String> {
+    let keychain = SecKeychain::default().map_err(|e| e.to_string())?;
+
+    if api_key.trim().is_empty() {
+        if let Ok((_, item)) =
+            keychain.find_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT_OPENAI_API_KEY)
+        {
+            item.delete();
+        }
+        return Ok(());
+    }
+
+    keychain
+        .set_generic_password(
+            KEYCHAIN_SERVICE,
+            KEYCHAIN_ACCOUNT_OPENAI_API_KEY,
+            api_key.as_bytes(),
+        )
+        .map_err(|e| e.to_string())
+}
+
+fn push_f32_samples(state: &RecordingState, data: &[f32], channels: usize) {
+    if channels <= 1 {
+        state.push_samples(data);
+        return;
+    }
+
+    let mono: Vec<f32> = data
+        .chunks(channels)
+        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
+        .collect();
+    state.push_samples(&mono);
+}
+
+fn push_i16_samples(state: &RecordingState, data: &[i16], channels: usize) {
+    let samples: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+    push_f32_samples(state, &samples, channels);
+}
+
+fn push_u16_samples(state: &RecordingState, data: &[u16], channels: usize) {
+    let samples: Vec<f32> = data
+        .iter()
+        .map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0)
+        .collect();
+    push_f32_samples(state, &samples, channels);
+}
 
 // Update tray status indicator
 #[tauri::command]
@@ -71,9 +129,9 @@ fn set_tray_status(app: tauri::AppHandle, status: String) {
         "processing" => "⏳",
         "success" => "✅",
         "error" => "❌",
-        _ => "",  // idle - no indicator
+        _ => "", // idle - no indicator
     };
-    
+
     app.tray_handle().set_title(indicator).ok();
 }
 
@@ -81,20 +139,17 @@ fn set_tray_status(app: tauri::AppHandle, status: String) {
 fn play_sound_internal(sound: &str) {
     let sound_path = match sound {
         "start" => "/System/Library/Sounds/Pop.aiff",
-        "stop" => "/System/Library/Sounds/Tink.aiff", 
+        "stop" => "/System/Library/Sounds/Tink.aiff",
         "success" => "/System/Library/Sounds/Glass.aiff",
         "error" => "/System/Library/Sounds/Basso.aiff",
         "cancel" => "/System/Library/Sounds/Funk.aiff",
         "pause" => "/System/Library/Sounds/Morse.aiff",
         _ => "/System/Library/Sounds/Pop.aiff",
     };
-    
+
     let path = sound_path.to_string();
     std::thread::spawn(move || {
-        Command::new("afplay")
-            .arg(path)
-            .output()
-            .ok();
+        Command::new("afplay").arg(path).output().ok();
     });
 }
 
@@ -106,19 +161,33 @@ fn play_sound(sound: String) {
 
 #[tauri::command]
 fn get_api_key() -> String {
-    load_config().api_key.unwrap_or_default()
+    if let Some(api_key) = get_api_key_from_keychain() {
+        return api_key;
+    }
+
+    let mut config = load_config();
+    let legacy_api_key = config.api_key.take().unwrap_or_default();
+    if !legacy_api_key.is_empty() && set_api_key_in_keychain(&legacy_api_key).is_ok() {
+        save_config(&config);
+    }
+    legacy_api_key
 }
 
 #[tauri::command]
-fn set_api_key(api_key: String) {
+fn set_api_key(api_key: String) -> Result<(), String> {
+    set_api_key_in_keychain(&api_key)?;
+
     let mut config = load_config();
-    config.api_key = Some(api_key);
+    config.api_key = None;
     save_config(&config);
+    Ok(())
 }
 
 #[tauri::command]
 fn get_model() -> String {
-    load_config().model.unwrap_or_else(|| "whisper-1".to_string())
+    load_config()
+        .model
+        .unwrap_or_else(|| "whisper-1".to_string())
 }
 
 #[tauri::command]
@@ -141,6 +210,18 @@ fn set_show_recording_overlay(show_recording_overlay: bool) {
 }
 
 #[tauri::command]
+fn get_prompt() -> String {
+    load_config().prompt.unwrap_or_default()
+}
+
+#[tauri::command]
+fn set_prompt(prompt: String) {
+    let mut config = load_config();
+    config.prompt = Some(prompt);
+    save_config(&config);
+}
+
+#[tauri::command]
 fn register_escape_hotkey(app: tauri::AppHandle) -> Result<(), String> {
     let handle = app.clone();
     app.global_shortcut_manager()
@@ -149,14 +230,14 @@ fn register_escape_hotkey(app: tauri::AppHandle) -> Result<(), String> {
                 window.emit("cancel-recording", ()).ok();
             }
         })
-        .map_err(|e| format!("Failed to register escape: {}", e))
+        .map_err(|e| format!("Failed to register escape: {e}"))
 }
 
 #[tauri::command]
 fn unregister_escape_hotkey(app: tauri::AppHandle) -> Result<(), String> {
     app.global_shortcut_manager()
         .unregister("Escape")
-        .map_err(|e| format!("Failed to unregister escape: {}", e))
+        .map_err(|e| format!("Failed to unregister escape: {e}"))
 }
 
 #[tauri::command]
@@ -170,67 +251,123 @@ fn start_recording(
 
     state.start();
 
-    // Show red dot in menu bar when recording
-    app.tray_handle().set_title("🔴").ok();
-
-    // Play start sound
-    play_sound_internal("start");
-
-    let state_clone = Arc::clone(&state.inner());
+    let state_clone = Arc::clone(state.inner());
+    let handle = app.clone();
+    let (ready_tx, ready_rx) = mpsc::channel();
 
     std::thread::spawn(move || {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .expect("No input device available");
-
-        let config = device
-            .default_input_config()
-            .expect("Failed to get default input config");
-
-        *state_clone.sample_rate.lock() = config.sample_rate().0;
-
-        let state_for_callback = Arc::clone(&state_clone);
-
-        let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => device
-                .build_input_stream(
-                    &config.into(),
-                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        state_for_callback.push_samples(data);
-                    },
-                    |err| eprintln!("Stream error: {}", err),
-                    None,
-                )
-                .expect("Failed to build input stream"),
-            cpal::SampleFormat::I16 => device
-                .build_input_stream(
-                    &config.into(),
-                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                        let float_data: Vec<f32> = data
-                            .iter()
-                            .map(|&s| s as f32 / i16::MAX as f32)
-                            .collect();
-                        state_for_callback.push_samples(&float_data);
-                    },
-                    |err| eprintln!("Stream error: {}", err),
-                    None,
-                )
-                .expect("Failed to build input stream"),
-            _ => panic!("Unsupported sample format"),
+        let Some(device) = host.default_input_device() else {
+            state_clone.cancel();
+            let _ = ready_tx.send(Err("No input device available".to_string()));
+            return;
         };
 
-        stream.play().expect("Failed to start recording");
+        let config = match device.default_input_config() {
+            Ok(config) => config,
+            Err(error) => {
+                state_clone.cancel();
+                let _ = ready_tx.send(Err(format!("Failed to get default input config: {error}")));
+                return;
+            }
+        };
 
-        // Keep recording until stopped
+        *state_clone.sample_rate.lock() = config.sample_rate().0;
+        let stream_config: cpal::StreamConfig = config.clone().into();
+        let channels = usize::from(stream_config.channels);
+
+        let stream_result = match config.sample_format() {
+            cpal::SampleFormat::F32 => {
+                let state_for_callback = Arc::clone(&state_clone);
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        push_f32_samples(&state_for_callback, data, channels);
+                    },
+                    |err| eprintln!("Stream error: {err}"),
+                    None,
+                )
+            }
+            cpal::SampleFormat::I16 => {
+                let state_for_callback = Arc::clone(&state_clone);
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        push_i16_samples(&state_for_callback, data, channels);
+                    },
+                    |err| eprintln!("Stream error: {err}"),
+                    None,
+                )
+            }
+            cpal::SampleFormat::U16 => {
+                let state_for_callback = Arc::clone(&state_clone);
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                        push_u16_samples(&state_for_callback, data, channels);
+                    },
+                    |err| eprintln!("Stream error: {err}"),
+                    None,
+                )
+            }
+            sample_format => {
+                state_clone.cancel();
+                let _ = ready_tx.send(Err(format!(
+                    "Unsupported input sample format: {sample_format:?}"
+                )));
+                return;
+            }
+        };
+
+        let stream = match stream_result {
+            Ok(stream) => stream,
+            Err(error) => {
+                state_clone.cancel();
+                let _ = ready_tx.send(Err(format!("Failed to build input stream: {error}")));
+                return;
+            }
+        };
+
+        if let Err(error) = stream.play() {
+            state_clone.cancel();
+            let _ = ready_tx.send(Err(format!("Failed to start recording: {error}")));
+            return;
+        }
+
+        let _ = ready_tx.send(Ok(()));
+        let started_at = Instant::now();
+
         while state_clone.is_active() {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            if started_at.elapsed() >= MAX_RECORDING_DURATION {
+                state_clone.stop();
+                if let Some(window) = handle.get_window("main") {
+                    window.emit("recording-time-limit-reached", ()).ok();
+                }
+                break;
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
         }
 
         drop(stream);
     });
 
-    Ok(())
+    match ready_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(())) => {
+            app.tray_handle().set_title("🔴").ok();
+            play_sound_internal("start");
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            app.tray_handle().set_title("❌").ok();
+            Err(error)
+        }
+        Err(_) => {
+            state.cancel();
+            app.tray_handle().set_title("❌").ok();
+            Err("Timed out while starting microphone input".into())
+        }
+    }
 }
 
 #[tauri::command]
@@ -261,15 +398,13 @@ fn stop_recording(
     }
 
     // Check if audio is silent (likely microphone permission issue)
-    let sum: f32 = samples.iter().map(|s| s * s).sum();
-    let rms = (sum / samples.len() as f32).sqrt();
-    if rms < 0.001 {
+    if !state.has_audio_content() {
         return Err("No audio detected. Please check microphone permissions in System Settings → Privacy & Security → Microphone".into());
     }
 
     // Generate filename with timestamp
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let filename = format!("{}.wav", timestamp);
+    let filename = format!("{timestamp}.wav");
     let filepath = get_transcripts_dir().join(&filename);
 
     // Write WAV file
@@ -281,7 +416,8 @@ fn stop_recording(
     };
 
     let file = File::create(&filepath).map_err(|e| e.to_string())?;
-    let mut writer = hound::WavWriter::new(BufWriter::new(file), spec).map_err(|e| e.to_string())?;
+    let mut writer =
+        hound::WavWriter::new(BufWriter::new(file), spec).map_err(|e| e.to_string())?;
 
     for sample in &samples {
         let amplitude = (sample * i16::MAX as f32) as i16;
@@ -351,7 +487,7 @@ async fn transcribe(
     // Read the audio file
     let audio_data = tokio::fs::read(&audio_path)
         .await
-        .map_err(|e| format!("Failed to read audio file: {}", e))?;
+        .map_err(|e| format!("Failed to read audio file: {e}"))?;
 
     let file_name = std::path::Path::new(&audio_path)
         .file_name()
@@ -387,21 +523,21 @@ async fn transcribe(
     // Send to OpenAI
     let response = client
         .post("https://api.openai.com/v1/audio/transcriptions")
-        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Authorization", format!("Bearer {api_key}"))
         .multipart(form)
         .send()
         .await
-        .map_err(|e| format!("API request failed: {}", e))?;
+        .map_err(|e| format!("API request failed: {e}"))?;
 
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
-        return Err(format!("OpenAI API error: {}", error_text));
+        return Err(format!("OpenAI API error: {error_text}"));
     }
 
     let transcript = response
         .text()
         .await
-        .map_err(|e| format!("Failed to read response: {}", e))?;
+        .map_err(|e| format!("Failed to read response: {e}"))?;
 
     Ok(transcript.trim().to_string())
 }
@@ -430,8 +566,8 @@ fn main() {
                     }
                 })
                 .expect("Failed to register global shortcut");
-            
-Ok(())
+
+            Ok(())
         })
         .on_system_tray_event(|app, event| match event {
             SystemTrayEvent::LeftClick { .. } => {
@@ -467,6 +603,8 @@ Ok(())
             set_model,
             get_show_recording_overlay,
             set_show_recording_overlay,
+            get_prompt,
+            set_prompt,
             register_escape_hotkey,
             unregister_escape_hotkey,
             start_recording,

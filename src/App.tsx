@@ -175,6 +175,10 @@ function App() {
     invoke<boolean>('get_show_recording_overlay').then((savedPreference) => {
       setShowRecordingOverlay(savedPreference)
     }).catch(() => {})
+
+    invoke<string>('get_prompt').then((savedPrompt) => {
+      if (savedPrompt) setPrompt(savedPrompt)
+    }).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -208,6 +212,15 @@ function App() {
       await invoke('set_show_recording_overlay', { showRecordingOverlay: enabled })
     } catch (saveError) {
       console.error('Failed to save overlay preference:', saveError)
+    }
+  }
+
+  const handlePromptChange = async (nextPrompt: string) => {
+    setPrompt(nextPrompt)
+    try {
+      await invoke('set_prompt', { prompt: nextPrompt })
+    } catch (saveError) {
+      console.error('Failed to save vocabulary hints:', saveError)
     }
   }
 
@@ -380,6 +393,16 @@ function App() {
       unlisten.then((dispose) => dispose())
     }
   }, [showSettingsWindow])
+
+  useEffect(() => {
+    const unlisten = listen('recording-time-limit-reached', () => {
+      stopRecording()
+    })
+
+    return () => {
+      unlisten.then((dispose) => dispose())
+    }
+  }, [stopRecording])
 
   useEffect(() => {
     if (showRecordingOverlay || viewMode !== 'overlay' || status === 'error') return
@@ -568,9 +591,9 @@ function App() {
             onChange={(event) => handleModelChange(event.target.value)}
             style={{ cursor: 'pointer' }}
           >
-            <option value="whisper-1">whisper-1 — $0.006/min, classic</option>
-            <option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe — $0.003/min, faster &amp; cheaper</option>
-            <option value="gpt-4o-transcribe">gpt-4o-transcribe — $0.006/min, best quality</option>
+            <option value="whisper-1">whisper-1 — classic</option>
+            <option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe — faster, lower cost</option>
+            <option value="gpt-4o-transcribe">gpt-4o-transcribe — best quality</option>
           </select>
         </div>
 
@@ -595,7 +618,7 @@ function App() {
             className="api-key-input vocabulary-input"
             placeholder="Technical terms, names, acronyms..."
             value={prompt}
-            onChange={(event) => setPrompt(event.target.value)}
+            onChange={(event) => handlePromptChange(event.target.value)}
           />
           <p className="settings-note">Add terms the model should recognize correctly</p>
         </div>

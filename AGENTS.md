@@ -21,4 +21,5 @@ npm run tauri build      # Build .app
 - Recording overlay can be disabled; when disabled, dictation stays minimized unless Scribe needs attention
 - Tray status: 🔴 recording, ⏳ processing, ✅ success, ❌ error
 - Audio saved to `~/Library/VoiceTranscripts/`
-- Settings stored in `~/Library/Application Support/scribe/config.json` (`api_key`, `model`, `show_recording_overlay`)
+- API key stored in macOS Keychain (`com.scribe.app` / `openai-api-key`)
+- Settings stored in `~/Library/Application Support/scribe/config.json` (`model`, `show_recording_overlay`, `prompt`; legacy `api_key` is migrated to Keychain on read)
