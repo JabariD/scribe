@@ -13,6 +13,8 @@ I wanted something simple: hotkey → speak → clipboard. No subscriptions, no 
 - **OpenAI Whisper**: Fast, accurate transcription
 - **Menubar App**: Lives in your system tray
 - **Auto-clipboard**: Transcriptions copied automatically
+- **Optional cleanup pass**: Remove filler words and fix punctuation, spelling, and grammar before copying
+- **Local history**: Previous transcripts are saved locally with configurable expiration
 
 ## Install
 
@@ -56,13 +58,15 @@ Requires: Node.js 18+, Rust, Xcode CLI tools
 - **Audio recordings**: `~/Library/VoiceTranscripts/`
 - **API key**: macOS Keychain
 - **Config**: `~/Library/Application Support/scribe/config.json`
+- **Transcript history**: Stored locally in the app webview storage
 
 ## Tech Stack
 
 - **Tauri** (Rust) - Native app shell
 - **React** + TypeScript - UI
 - **cpal** - Audio capture
-- **OpenAI Whisper** (`whisper-1`) - Pure transcription, no AI interpretation
+- **OpenAI transcription models** (`whisper-1`, `gpt-4o-mini-transcribe`, `gpt-4o-transcribe`) - Speech-to-text
+- **OpenAI text model** (`gpt-4o-mini`) - Optional transcript cleanup
 
 ## Permissions Required
 

@@ -22,4 +22,5 @@ npm run tauri build      # Build .app
 - Tray status: 🔴 recording, ⏳ processing, ✅ success, ❌ error
 - Audio saved to `~/Library/VoiceTranscripts/`
 - API key stored in macOS Keychain (`com.scribe.app` / `openai-api-key`)
-- Settings stored in `~/Library/Application Support/scribe/config.json` (`model`, `show_recording_overlay`, `prompt`; legacy `api_key` is migrated to Keychain on read)
+- Settings stored in `~/Library/Application Support/scribe/config.json` (`model`, `show_recording_overlay`, `prompt`, `post_process_enabled`, `post_process_prompt`; legacy `api_key` is migrated to Keychain on read)
+- Transcript history is stored locally in the Tauri webview `localStorage` with user-configurable day-based retention

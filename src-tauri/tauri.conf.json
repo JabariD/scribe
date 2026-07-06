@@ -7,7 +7,7 @@
   },
   "package": {
     "productName": "Scribe",
-    "version": "0.3.1"
+    "version": "0.3.2"
   },
   "tauri": {
     "allowlist": {
@@ -78,10 +78,10 @@
     "windows": [
       {
         "fullscreen": false,
-        "height": 520,
-        "resizable": false,
+        "height": 620,
+        "resizable": true,
         "title": "Scribe",
-        "width": 320,
+        "width": 400,
         "visible": false,
         "skipTaskbar": true,
         "decorations": false,

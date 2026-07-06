@@ -7,6 +7,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use recording::RecordingState;
 use security_framework::os::macos::keychain::SecKeychain;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::PathBuf;
@@ -24,10 +25,21 @@ struct Config {
     model: Option<String>,
     show_recording_overlay: Option<bool>,
     prompt: Option<String>,
+    post_process_enabled: Option<bool>,
+    post_process_prompt: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TranscriptionResult {
+    transcript: String,
+    post_process_applied: bool,
+    post_process_error: Option<String>,
 }
 
 const KEYCHAIN_SERVICE: &str = "com.scribe.app";
 const KEYCHAIN_ACCOUNT_OPENAI_API_KEY: &str = "openai-api-key";
+const POST_PROCESS_MODEL: &str = "gpt-4o-mini";
+const DEFAULT_POST_PROCESS_PROMPT: &str = "Clean up this voice transcript. Remove filler words like um, uh, ah, and you know. Fix punctuation, capitalization, spelling, and grammar. Preserve the speaker's meaning, wording, tone, and formatting as much as possible. Return only the cleaned transcript.";
 const MAX_RECORDING_DURATION: Duration = Duration::from_secs(10 * 60);
 
 fn get_config_path() -> PathBuf {
@@ -218,6 +230,32 @@ fn get_prompt() -> String {
 fn set_prompt(prompt: String) {
     let mut config = load_config();
     config.prompt = Some(prompt);
+    save_config(&config);
+}
+
+#[tauri::command]
+fn get_post_process_enabled() -> bool {
+    load_config().post_process_enabled.unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_post_process_enabled(post_process_enabled: bool) {
+    let mut config = load_config();
+    config.post_process_enabled = Some(post_process_enabled);
+    save_config(&config);
+}
+
+#[tauri::command]
+fn get_post_process_prompt() -> String {
+    load_config()
+        .post_process_prompt
+        .unwrap_or_else(|| DEFAULT_POST_PROCESS_PROMPT.to_string())
+}
+
+#[tauri::command]
+fn set_post_process_prompt(post_process_prompt: String) {
+    let mut config = load_config();
+    config.post_process_prompt = Some(post_process_prompt);
     save_config(&config);
 }
 
@@ -475,13 +513,69 @@ fn is_paused(state: tauri::State<'_, Arc<RecordingState>>) -> bool {
     state.is_paused()
 }
 
+async fn post_process_transcript(
+    client: &reqwest::Client,
+    api_key: &str,
+    transcript: &str,
+    prompt: Option<String>,
+) -> Result<String, String> {
+    let system_prompt = prompt
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_POST_PROCESS_PROMPT.to_string());
+
+    let response = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": POST_PROCESS_MODEL,
+            "temperature": 0,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": format!("Clean this transcript and return only the final text:\n\n{transcript}")
+                }
+            ]
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Post-process request failed: {e}"))?;
+
+    if !response.status().is_success() {
+        let error_text = response.text().await.unwrap_or_default();
+        return Err(format!("Post-process API error: {error_text}"));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to read post-process response: {e}"))?;
+
+    let cleaned = body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if cleaned.is_empty() {
+        return Err("Post-process returned an empty transcript".to_string());
+    }
+
+    Ok(cleaned)
+}
+
 #[tauri::command]
 async fn transcribe(
     audio_path: String,
     api_key: String,
     model: Option<String>,
     prompt: Option<String>,
-) -> Result<String, String> {
+    post_process_enabled: Option<bool>,
+    post_process_prompt: Option<String>,
+) -> Result<TranscriptionResult, String> {
     let client = reqwest::Client::new();
 
     // Read the audio file
@@ -537,9 +631,30 @@ async fn transcribe(
     let transcript = response
         .text()
         .await
-        .map_err(|e| format!("Failed to read response: {e}"))?;
+        .map_err(|e| format!("Failed to read response: {e}"))?
+        .trim()
+        .to_string();
 
-    Ok(transcript.trim().to_string())
+    if !post_process_enabled.unwrap_or(false) {
+        return Ok(TranscriptionResult {
+            transcript,
+            post_process_applied: false,
+            post_process_error: None,
+        });
+    }
+
+    match post_process_transcript(&client, &api_key, &transcript, post_process_prompt).await {
+        Ok(cleaned) => Ok(TranscriptionResult {
+            transcript: cleaned,
+            post_process_applied: true,
+            post_process_error: None,
+        }),
+        Err(error) => Ok(TranscriptionResult {
+            transcript,
+            post_process_applied: false,
+            post_process_error: Some(error),
+        }),
+    }
 }
 
 fn main() {
@@ -605,6 +720,10 @@ fn main() {
             set_show_recording_overlay,
             get_prompt,
             set_prompt,
+            get_post_process_enabled,
+            set_post_process_enabled,
+            get_post_process_prompt,
+            set_post_process_prompt,
             register_escape_hotkey,
             unregister_escape_hotkey,
             start_recording,
