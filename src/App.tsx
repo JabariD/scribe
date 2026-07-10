@@ -131,6 +131,7 @@ function App() {
   const [apiKey, setApiKey] = useState<string>('')
   const [model, setModel] = useState<string>('whisper-1')
   const [showRecordingOverlay, setShowRecordingOverlay] = useState<boolean>(true)
+  const [realtimeTranscriptionEnabled, setRealtimeTranscriptionEnabled] = useState<boolean>(false)
   const [prompt, setPrompt] = useState<string>(DEFAULT_PROMPT)
   const [postProcessEnabled, setPostProcessEnabled] = useState<boolean>(false)
   const [postProcessPrompt, setPostProcessPrompt] = useState<string>(DEFAULT_POST_PROCESS_PROMPT)
@@ -142,6 +143,7 @@ function App() {
   const levelIntervalRef = useRef<number | null>(null)
   const hideTimerRef = useRef<number | null>(null)
   const waveformFrameRef = useRef(0)
+  const liveTranscriptionStartedRef = useRef(false)
 
   const addLog = useCallback((message: string, level: AppLogLevel = 'info') => {
     const now = new Date()
@@ -325,6 +327,10 @@ function App() {
       setShowRecordingOverlay(savedPreference)
     }).catch(() => {})
 
+    invoke<boolean>('get_realtime_transcription_enabled').then((savedPreference) => {
+      setRealtimeTranscriptionEnabled(savedPreference)
+    }).catch(() => {})
+
     invoke<string>('get_prompt').then((savedPrompt) => {
       if (savedPrompt) setPrompt(savedPrompt)
     }).catch(() => {})
@@ -369,6 +375,16 @@ function App() {
       await invoke('set_show_recording_overlay', { showRecordingOverlay: enabled })
     } catch (saveError) {
       console.error('Failed to save overlay preference:', saveError)
+    }
+  }
+
+  const handleRealtimeTranscriptionChange = async (enabled: boolean) => {
+    setRealtimeTranscriptionEnabled(enabled)
+    addLog(enabled ? 'Realtime transcription enabled' : 'Realtime transcription disabled')
+    try {
+      await invoke('set_realtime_transcription_enabled', { realtimeTranscriptionEnabled: enabled })
+    } catch (saveError) {
+      console.error('Failed to save realtime transcription preference:', saveError)
     }
   }
 
@@ -422,6 +438,22 @@ function App() {
 
     try {
       await invoke('start_recording')
+      liveTranscriptionStartedRef.current = false
+      if (realtimeTranscriptionEnabled) {
+        try {
+          await invoke('start_live_transcription', {
+            apiKey,
+            model,
+            prompt,
+          })
+          liveTranscriptionStartedRef.current = true
+          addLog(model === 'whisper-1'
+            ? 'Realtime transcription started with gpt-4o-mini-transcribe'
+            : `Realtime transcription started with ${model}`)
+        } catch (liveError) {
+          addLog(`Realtime unavailable; using standard transcription: ${liveError}`, 'error')
+        }
+      }
       await invoke('register_escape_hotkey')
       setStatus('recording')
       addLog('Recording started')
@@ -441,7 +473,7 @@ function App() {
       invoke('play_sound', { sound: 'error' }).catch(() => {})
       await showSettingsWindow()
     }
-  }, [addLog, apiKey, clearHideTimer, hideWindow, resetWaveform, showOverlayWindow, showRecordingOverlay, showSettingsWindow, startAudioPolling, status])
+  }, [addLog, apiKey, clearHideTimer, hideWindow, model, prompt, realtimeTranscriptionEnabled, resetWaveform, showOverlayWindow, showRecordingOverlay, showSettingsWindow, startAudioPolling, status])
 
   const stopRecording = useCallback(async () => {
     if (!isRecordingStatus(status)) return
@@ -459,16 +491,42 @@ function App() {
 
       const audioPath = await invoke<string>('stop_recording')
       await invoke('set_tray_status', { status: 'processing' })
-      addLog(postProcessEnabled ? 'Transcribing with post-processing' : 'Transcribing audio')
+      addLog(postProcessEnabled ? 'Finishing transcript with post-processing' : 'Finishing transcript')
 
-      const result = await invoke<TranscriptionResult>('transcribe', {
-        audioPath,
-        apiKey,
-        model: model || null,
-        prompt: prompt || null,
-        postProcessEnabled,
-        postProcessPrompt: postProcessPrompt || null,
-      })
+      let result: TranscriptionResult
+      if (liveTranscriptionStartedRef.current) {
+        try {
+          const liveTranscript = await invoke<string>('finish_live_transcription')
+          result = await invoke<TranscriptionResult>('finalize_live_transcript', {
+            transcript: liveTranscript,
+            apiKey,
+            postProcessEnabled,
+            postProcessPrompt: postProcessPrompt || null,
+          })
+          addLog('Realtime transcript completed')
+        } catch (liveError) {
+          addLog(`Realtime transcription failed; retrying from saved audio: ${liveError}`, 'error')
+          result = await invoke<TranscriptionResult>('transcribe', {
+            audioPath,
+            apiKey,
+            model: model || null,
+            prompt: prompt || null,
+            postProcessEnabled,
+            postProcessPrompt: postProcessPrompt || null,
+          })
+        } finally {
+          liveTranscriptionStartedRef.current = false
+        }
+      } else {
+        result = await invoke<TranscriptionResult>('transcribe', {
+          audioPath,
+          apiKey,
+          model: model || null,
+          prompt: prompt || null,
+          postProcessEnabled,
+          postProcessPrompt: postProcessPrompt || null,
+        })
+      }
 
       if (result.post_process_error) {
         addLog(`Post-processing skipped: ${result.post_process_error}`, 'error')
@@ -489,6 +547,10 @@ function App() {
       setStatus('success')
       scheduleHide(1800)
     } catch (stopError) {
+      if (liveTranscriptionStartedRef.current) {
+        invoke('cancel_live_transcription').catch(() => {})
+        liveTranscriptionStartedRef.current = false
+      }
       const message = `${stopError}`
       setError(message)
       setStatus('error')
@@ -520,6 +582,11 @@ function App() {
     clearLevelPolling()
     setAudioLevel(0)
     resetWaveform()
+
+    if (liveTranscriptionStartedRef.current) {
+      invoke('cancel_live_transcription').catch(() => {})
+      liveTranscriptionStartedRef.current = false
+    }
 
     try {
       await invoke('cancel_recording')
@@ -833,6 +900,18 @@ function App() {
                   <span>
                     <strong>Show recording HUD</strong>
                     <small>When off, dictation stays minimized unless Scribe needs your attention.</small>
+                  </span>
+                </label>
+
+                <label className="checkbox-setting">
+                  <input
+                    type="checkbox"
+                    checked={realtimeTranscriptionEnabled}
+                    onChange={(event) => handleRealtimeTranscriptionChange(event.target.checked)}
+                  />
+                  <span>
+                    <strong>Transcribe while recording</strong>
+                    <small>Reduces the wait after stopping. whisper-1 uses gpt-4o-mini-transcribe in this mode.</small>
                   </span>
                 </label>
               </section>

@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod realtime;
 mod recording;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -24,6 +25,7 @@ struct Config {
     api_key: Option<String>, // legacy; migrated to macOS Keychain on read
     model: Option<String>,
     show_recording_overlay: Option<bool>,
+    realtime_transcription_enabled: Option<bool>,
     prompt: Option<String>,
     post_process_enabled: Option<bool>,
     post_process_prompt: Option<String>,
@@ -34,6 +36,11 @@ struct TranscriptionResult {
     transcript: String,
     post_process_applied: bool,
     post_process_error: Option<String>,
+}
+
+#[derive(Default)]
+struct LiveTranscriptionState {
+    result: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<Result<String, String>>>>,
 }
 
 const KEYCHAIN_SERVICE: &str = "com.scribe.app";
@@ -222,6 +229,20 @@ fn set_show_recording_overlay(show_recording_overlay: bool) {
 }
 
 #[tauri::command]
+fn get_realtime_transcription_enabled() -> bool {
+    load_config()
+        .realtime_transcription_enabled
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_realtime_transcription_enabled(realtime_transcription_enabled: bool) {
+    let mut config = load_config();
+    config.realtime_transcription_enabled = Some(realtime_transcription_enabled);
+    save_config(&config);
+}
+
+#[tauri::command]
 fn get_prompt() -> String {
     load_config().prompt.unwrap_or_default()
 }
@@ -257,6 +278,64 @@ fn set_post_process_prompt(post_process_prompt: String) {
     let mut config = load_config();
     config.post_process_prompt = Some(post_process_prompt);
     save_config(&config);
+}
+
+#[tauri::command]
+async fn start_live_transcription(
+    state: tauri::State<'_, Arc<RecordingState>>,
+    live_state: tauri::State<'_, LiveTranscriptionState>,
+    api_key: String,
+    model: String,
+    prompt: String,
+) -> Result<(), String> {
+    if !state.is_active() {
+        return Err("Start recording before realtime transcription".into());
+    }
+
+    let mut current_result = live_state.result.lock().await;
+    if current_result.is_some() {
+        return Err("Realtime transcription is already active".into());
+    }
+
+    let audio = state.start_live_audio();
+    let sample_rate = *state.sample_rate.lock();
+    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    *current_result = Some(result_receiver);
+
+    tauri::async_runtime::spawn(async move {
+        let result =
+            realtime::transcribe_audio_stream(api_key, model, prompt, sample_rate, audio).await;
+        let _ = result_sender.send(result);
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn finish_live_transcription(
+    live_state: tauri::State<'_, LiveTranscriptionState>,
+) -> Result<String, String> {
+    let result_receiver = live_state
+        .result
+        .lock()
+        .await
+        .take()
+        .ok_or_else(|| "Realtime transcription is not active".to_string())?;
+
+    tokio::time::timeout(Duration::from_secs(10), result_receiver)
+        .await
+        .map_err(|_| "Timed out while finishing realtime transcription".to_string())?
+        .map_err(|_| "Realtime transcription ended unexpectedly".to_string())?
+}
+
+#[tauri::command]
+async fn cancel_live_transcription(
+    state: tauri::State<'_, Arc<RecordingState>>,
+    live_state: tauri::State<'_, LiveTranscriptionState>,
+) -> Result<(), String> {
+    state.stop_live_audio();
+    live_state.result.lock().await.take();
+    Ok(())
 }
 
 #[tauri::command]
@@ -643,7 +722,16 @@ async fn transcribe(
         });
     }
 
-    match post_process_transcript(&client, &api_key, &transcript, post_process_prompt).await {
+    finalize_transcript_internal(&client, &api_key, transcript, post_process_prompt).await
+}
+
+async fn finalize_transcript_internal(
+    client: &reqwest::Client,
+    api_key: &str,
+    transcript: String,
+    post_process_prompt: Option<String>,
+) -> Result<TranscriptionResult, String> {
+    match post_process_transcript(client, api_key, &transcript, post_process_prompt).await {
         Ok(cleaned) => Ok(TranscriptionResult {
             transcript: cleaned,
             post_process_applied: true,
@@ -655,6 +743,25 @@ async fn transcribe(
             post_process_error: Some(error),
         }),
     }
+}
+
+#[tauri::command]
+async fn finalize_live_transcript(
+    transcript: String,
+    api_key: String,
+    post_process_enabled: bool,
+    post_process_prompt: Option<String>,
+) -> Result<TranscriptionResult, String> {
+    if !post_process_enabled {
+        return Ok(TranscriptionResult {
+            transcript,
+            post_process_applied: false,
+            post_process_error: None,
+        });
+    }
+
+    let client = reqwest::Client::new();
+    finalize_transcript_internal(&client, &api_key, transcript, post_process_prompt).await
 }
 
 fn main() {
@@ -669,6 +776,7 @@ fn main() {
 
     tauri::Builder::default()
         .manage(recording_state)
+        .manage(LiveTranscriptionState::default())
         .system_tray(system_tray)
         .setup(|app| {
             // Register global shortcut from Rust (more reliable than JS)
@@ -718,12 +826,18 @@ fn main() {
             set_model,
             get_show_recording_overlay,
             set_show_recording_overlay,
+            get_realtime_transcription_enabled,
+            set_realtime_transcription_enabled,
             get_prompt,
             set_prompt,
             get_post_process_enabled,
             set_post_process_enabled,
             get_post_process_prompt,
             set_post_process_prompt,
+            start_live_transcription,
+            finish_live_transcription,
+            cancel_live_transcription,
+            finalize_live_transcript,
             register_escape_hotkey,
             unregister_escape_hotkey,
             start_recording,

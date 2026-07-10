@@ -1,6 +1,6 @@
 [package]
 name = "scribe"
-version = "0.3.2"
+version = "0.4.0"
 description = "Voice-to-text transcription app"
 authors = ["Payton Dennis"]
 license = "MIT"
@@ -22,6 +22,9 @@ hound = "3.5"
 dirs = "5.0"
 chrono = "0.4"
 parking_lot = "0.12"
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+base64 = "0.22"
 
 [features]
 default = ["custom-protocol"]

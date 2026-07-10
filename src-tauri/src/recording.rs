@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 
 /// Core recording state machine - manages recording, pause, and audio data
 pub struct RecordingState {
@@ -8,6 +9,7 @@ pub struct RecordingState {
     pub audio_level: Mutex<f32>,
     pub samples: Mutex<Vec<f32>>,
     pub sample_rate: Mutex<u32>,
+    live_audio_sender: Mutex<Option<SyncSender<Vec<f32>>>>,
 }
 
 impl Default for RecordingState {
@@ -18,6 +20,7 @@ impl Default for RecordingState {
             audio_level: Mutex::new(0.0),
             samples: Mutex::new(Vec::new()),
             sample_rate: Mutex::new(44100),
+            live_audio_sender: Mutex::new(None),
         }
     }
 }
@@ -26,6 +29,7 @@ impl RecordingState {
     /// Start recording - clears previous samples and resets pause state
     pub fn start(&self) {
         self.samples.lock().clear();
+        self.live_audio_sender.lock().take();
         self.is_recording.store(true, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
     }
@@ -35,6 +39,7 @@ impl RecordingState {
         self.is_recording.store(false, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
         *self.audio_level.lock() = 0.0;
+        self.live_audio_sender.lock().take();
         self.samples.lock().clone()
     }
 
@@ -44,6 +49,18 @@ impl RecordingState {
         self.is_paused.store(false, Ordering::SeqCst);
         *self.audio_level.lock() = 0.0;
         self.samples.lock().clear();
+        self.live_audio_sender.lock().take();
+    }
+
+    /// Send captured audio to a bounded realtime consumer without blocking the microphone callback.
+    pub fn start_live_audio(&self) -> Receiver<Vec<f32>> {
+        let (sender, receiver) = mpsc::sync_channel(64);
+        *self.live_audio_sender.lock() = Some(sender);
+        receiver
+    }
+
+    pub fn stop_live_audio(&self) {
+        self.live_audio_sender.lock().take();
     }
 
     /// Toggle pause state - returns new paused state
@@ -77,13 +94,18 @@ impl RecordingState {
         if !self.should_capture() {
             return;
         }
-        
+
         // Calculate RMS audio level
         let sum: f32 = data.iter().map(|s| s * s).sum();
         let rms = (sum / data.len() as f32).sqrt();
         *self.audio_level.lock() = rms.min(1.0);
-        
+
         self.samples.lock().extend_from_slice(data);
+
+        if let Some(sender) = self.live_audio_sender.lock().as_ref() {
+            // Dropping a chunk is safer than blocking the real-time audio callback.
+            let _ = sender.try_send(data.to_vec());
+        }
     }
 
     /// Get current audio level
@@ -119,7 +141,7 @@ mod tests {
     fn test_start_recording() {
         let state = RecordingState::default();
         state.start();
-        
+
         assert!(state.is_active());
         assert!(!state.is_paused());
         assert!(state.should_capture());
@@ -129,9 +151,9 @@ mod tests {
     fn test_start_clears_previous_samples() {
         let state = RecordingState::default();
         state.samples.lock().extend_from_slice(&[0.1, 0.2, 0.3]);
-        
+
         state.start();
-        
+
         assert!(state.samples.lock().is_empty());
     }
 
@@ -140,9 +162,9 @@ mod tests {
         let state = RecordingState::default();
         state.start();
         state.push_samples(&[0.5, 0.5, 0.5]);
-        
+
         let samples = state.stop();
-        
+
         assert!(!state.is_active());
         assert_eq!(samples.len(), 3);
         assert_eq!(state.get_audio_level(), 0.0);
@@ -153,9 +175,9 @@ mod tests {
         let state = RecordingState::default();
         state.start();
         state.push_samples(&[0.5, 0.5, 0.5]);
-        
+
         state.cancel();
-        
+
         assert!(!state.is_active());
         assert!(state.samples.lock().is_empty());
     }
@@ -164,9 +186,9 @@ mod tests {
     fn test_pause_stops_capture() {
         let state = RecordingState::default();
         state.start();
-        
+
         let is_paused = state.toggle_pause();
-        
+
         assert!(is_paused);
         assert!(state.is_active()); // still "recording" session
         assert!(state.is_paused());
@@ -178,9 +200,9 @@ mod tests {
         let state = RecordingState::default();
         state.start();
         state.toggle_pause(); // pause
-        
+
         let is_paused = state.toggle_pause(); // resume
-        
+
         assert!(!is_paused);
         assert!(state.should_capture());
     }
@@ -190,13 +212,13 @@ mod tests {
         let state = RecordingState::default();
         state.start();
         state.push_samples(&[0.1, 0.2]);
-        
+
         state.toggle_pause();
         state.push_samples(&[0.3, 0.4]); // should be ignored
-        
+
         state.toggle_pause();
         state.push_samples(&[0.5, 0.6]);
-        
+
         let samples = state.samples.lock();
         assert_eq!(samples.len(), 4); // only pre-pause and post-resume
     }
@@ -205,11 +227,14 @@ mod tests {
     fn test_has_audio_content_detects_silence() {
         let state = RecordingState::default();
         state.start();
-        
+
         // Silent audio
-        state.samples.lock().extend_from_slice(&[0.0001, -0.0001, 0.0]);
+        state
+            .samples
+            .lock()
+            .extend_from_slice(&[0.0001, -0.0001, 0.0]);
         assert!(!state.has_audio_content());
-        
+
         // Reset and add real audio
         state.samples.lock().clear();
         state.samples.lock().extend_from_slice(&[0.5, -0.3, 0.4]);
@@ -221,9 +246,9 @@ mod tests {
         let state = RecordingState::default();
         state.start();
         state.toggle_pause();
-        
+
         state.stop();
-        
+
         assert!(!state.is_paused());
     }
 }

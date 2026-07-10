@@ -10,9 +10,10 @@ I wanted something simple: hotkey → speak → clipboard. No subscriptions, no 
 
 - **Global Hotkey**: `Cmd+Shift+Space` to start/stop recording
 - **Pause & Cancel**: Pause mid-recording or cancel with `Escape`
-- **OpenAI Whisper**: Fast, accurate transcription
+- **OpenAI transcription**: Fast, accurate transcription with optional realtime processing while you speak
 - **Menubar App**: Lives in your system tray
 - **Auto-clipboard**: Transcriptions copied automatically
+- **Optional realtime mode**: Process speech while recording to reduce the wait after stopping
 - **Optional cleanup pass**: Remove filler words and fix punctuation, spelling, and grammar before copying
 - **Local history**: Previous transcripts are saved locally with configurable expiration
 
