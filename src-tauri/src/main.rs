@@ -46,6 +46,7 @@ struct LiveTranscriptionState {
 const KEYCHAIN_SERVICE: &str = "com.scribe.app";
 const KEYCHAIN_ACCOUNT_OPENAI_API_KEY: &str = "openai-api-key";
 const POST_PROCESS_MODEL: &str = "gpt-4o-mini";
+const TRANSCRIPTION_LANGUAGE: &str = "en";
 const DEFAULT_POST_PROCESS_PROMPT: &str = "Clean up this voice transcript. Remove filler words like um, uh, ah, and you know. Fix punctuation, capitalization, spelling, and grammar. Preserve the speaker's meaning, wording, tone, and formatting as much as possible. Return only the cleaned transcript.";
 const MAX_RECORDING_DURATION: Duration = Duration::from_secs(10 * 60);
 
@@ -683,6 +684,7 @@ async fn transcribe(
 
     let mut form = reqwest::multipart::Form::new()
         .text("model", selected_model)
+        .text("language", TRANSCRIPTION_LANGUAGE)
         .text("response_format", "text")
         .part("file", part);
 

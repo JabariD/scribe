@@ -31,7 +31,6 @@ type TranscriptionResult = {
   post_process_error: string | null
 }
 
-const DEFAULT_PROMPT = `Technical terms: TypeScript, JavaScript, React, useState, useEffect, async, await, API, JSON, npm, git, GitHub, VS Code, macOS, iOS, Android`
 const DEFAULT_POST_PROCESS_PROMPT = `Clean up this voice transcript. Remove filler words like um, uh, ah, and you know. Fix punctuation, capitalization, spelling, and grammar. Preserve the speaker's meaning, wording, tone, and formatting as much as possible. Return only the cleaned transcript.`
 const SETTINGS_WINDOW_SIZE = { width: 400, height: 620 }
 const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
@@ -132,7 +131,7 @@ function App() {
   const [model, setModel] = useState<string>('whisper-1')
   const [showRecordingOverlay, setShowRecordingOverlay] = useState<boolean>(true)
   const [realtimeTranscriptionEnabled, setRealtimeTranscriptionEnabled] = useState<boolean>(false)
-  const [prompt, setPrompt] = useState<string>(DEFAULT_PROMPT)
+  const [prompt, setPrompt] = useState<string>('')
   const [postProcessEnabled, setPostProcessEnabled] = useState<boolean>(false)
   const [postProcessPrompt, setPostProcessPrompt] = useState<string>(DEFAULT_POST_PROCESS_PROMPT)
   const [historyRetentionDays, setHistoryRetentionDays] = useState<number>(DEFAULT_HISTORY_RETENTION_DAYS)
@@ -332,7 +331,7 @@ function App() {
     }).catch(() => {})
 
     invoke<string>('get_prompt').then((savedPrompt) => {
-      if (savedPrompt) setPrompt(savedPrompt)
+      setPrompt(savedPrompt)
     }).catch(() => {})
 
     invoke<boolean>('get_post_process_enabled').then((savedPreference) => {

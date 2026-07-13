@@ -7,6 +7,7 @@ use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
 const REALTIME_URL: &str = "wss://api.openai.com/v1/realtime?intent=transcription";
 const TARGET_SAMPLE_RATE: u32 = 24_000;
+const TRANSCRIPTION_LANGUAGE: &str = "en";
 
 /// Streams microphone chunks to OpenAI and returns the final transcript when the producer closes.
 pub async fn transcribe_audio_stream(
@@ -31,14 +32,7 @@ pub async fn transcribe_audio_stream(
         .map_err(|error| format!("Realtime API connection failed: {error}"))?;
     let (mut writer, mut reader) = socket.split();
 
-    let selected_model = match model.as_str() {
-        "gpt-4o-transcribe" => "gpt-4o-transcribe",
-        _ => "gpt-4o-mini-transcribe",
-    };
-    let mut transcription = json!({ "model": selected_model });
-    if !prompt.trim().is_empty() {
-        transcription["prompt"] = Value::String(prompt);
-    }
+    let transcription = transcription_settings(&model, &prompt);
 
     writer
         .send(Message::Text(
@@ -144,6 +138,23 @@ pub async fn transcribe_audio_stream(
     }
 }
 
+fn transcription_settings(model: &str, prompt: &str) -> Value {
+    let selected_model = match model {
+        "gpt-4o-transcribe" => "gpt-4o-transcribe",
+        _ => "gpt-4o-mini-transcribe",
+    };
+    let mut transcription = json!({
+        "model": selected_model,
+        // Scribe currently records English dictation only. This prevents the model from
+        // interpreting uncertain speech or trailing room noise as another language.
+        "language": TRANSCRIPTION_LANGUAGE,
+    });
+    if !prompt.trim().is_empty() {
+        transcription["prompt"] = Value::String(prompt.to_string());
+    }
+    transcription
+}
+
 fn append_segment(transcript: &mut String, segment: &str) {
     let segment = segment.trim();
     if segment.is_empty() {
@@ -178,6 +189,15 @@ mod tests {
         let input = vec![0.5; 48_000];
         let output = resample_to_pcm16(&input, 48_000, 24_000);
         assert_eq!(output.len(), 24_000 * 2);
+    }
+
+    #[test]
+    fn transcription_settings_are_english_without_an_implicit_prompt() {
+        let settings = transcription_settings("gpt-4o-mini-transcribe", "");
+
+        assert_eq!(settings["model"], "gpt-4o-mini-transcribe");
+        assert_eq!(settings["language"], "en");
+        assert!(settings.get("prompt").is_none());
     }
 
     #[test]
