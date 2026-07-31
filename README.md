@@ -66,7 +66,7 @@ Requires: Node.js 18+, Rust, Xcode CLI tools
 - **Tauri** (Rust) - Native app shell
 - **React** + TypeScript - UI
 - **cpal** - Audio capture
-- **OpenAI transcription models** (`whisper-1`, `gpt-4o-mini-transcribe`, `gpt-4o-transcribe`) - Speech-to-text
+- **OpenAI transcription models** (`gpt-transcribe` for saved recordings, `gpt-live-transcribe` while recording) - Speech-to-text
 - **OpenAI text model** (`gpt-4o-mini`) - Optional transcript cleanup
 
 ## Permissions Required
@@ -76,7 +76,7 @@ On first run, macOS will ask for:
 
 ## Cost
 
-OpenAI Whisper API costs ~$0.006/minute of audio. A typical 30-second recording costs less than $0.01.
+Transcription cost depends on the selected OpenAI transcription workflow. See OpenAI's current transcription pricing before estimating usage.
 
 ## Roadmap
 

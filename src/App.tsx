@@ -47,6 +47,8 @@ const HISTORY_STORAGE_KEY = 'scribe.transcriptHistory'
 const HISTORY_RETENTION_STORAGE_KEY = 'scribe.historyRetentionDays'
 const DEFAULT_HISTORY_RETENTION_DAYS = 30
 const MAX_HISTORY_ENTRIES = 200
+const FILE_TRANSCRIPTION_MODEL = 'gpt-transcribe'
+const LIVE_TRANSCRIPTION_MODEL = 'gpt-live-transcribe'
 
 function pruneHistory(entries: TranscriptHistoryEntry[], retentionDays: number) {
   const sortedEntries = [...entries].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
@@ -128,7 +130,6 @@ function App() {
   const [audioLevel, setAudioLevel] = useState<number>(0)
   const [waveform, setWaveform] = useState<number[]>(() => createWaveform(0))
   const [apiKey, setApiKey] = useState<string>('')
-  const [model, setModel] = useState<string>('whisper-1')
   const [showRecordingOverlay, setShowRecordingOverlay] = useState<boolean>(true)
   const [realtimeTranscriptionEnabled, setRealtimeTranscriptionEnabled] = useState<boolean>(false)
   const [prompt, setPrompt] = useState<string>('')
@@ -162,7 +163,7 @@ function App() {
     window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(nextHistory))
   }, [])
 
-  const addTranscriptToHistory = useCallback((nextTranscript: string, postProcessApplied: boolean) => {
+  const addTranscriptToHistory = useCallback((nextTranscript: string, model: string, postProcessApplied: boolean) => {
     const trimmedTranscript = nextTranscript.trim()
     if (!trimmedTranscript) return
 
@@ -179,7 +180,7 @@ function App() {
       saveTranscriptHistory(nextHistory)
       return nextHistory
     })
-  }, [historyRetentionDays, model, saveTranscriptHistory])
+  }, [historyRetentionDays, saveTranscriptHistory])
 
   const handleHistoryRetentionChange = useCallback((value: number) => {
     const nextRetentionDays = normalizeRetentionDays(value)
@@ -318,10 +319,6 @@ function App() {
       if (key) setApiKey(key)
     }).catch(() => {})
 
-    invoke<string>('get_model').then((savedModel) => {
-      if (savedModel) setModel(savedModel)
-    }).catch(() => {})
-
     invoke<boolean>('get_show_recording_overlay').then((savedPreference) => {
       setShowRecordingOverlay(savedPreference)
     }).catch(() => {})
@@ -356,15 +353,6 @@ function App() {
       await invoke('set_api_key', { apiKey: key })
     } catch (saveError) {
       console.error('Failed to save API key:', saveError)
-    }
-  }
-
-  const handleModelChange = async (nextModel: string) => {
-    setModel(nextModel)
-    try {
-      await invoke('set_model', { model: nextModel })
-    } catch (saveError) {
-      console.error('Failed to save model:', saveError)
     }
   }
 
@@ -442,13 +430,10 @@ function App() {
         try {
           await invoke('start_live_transcription', {
             apiKey,
-            model,
             prompt,
           })
           liveTranscriptionStartedRef.current = true
-          addLog(model === 'whisper-1'
-            ? 'Realtime transcription started with gpt-4o-mini-transcribe'
-            : `Realtime transcription started with ${model}`)
+          addLog(`Realtime transcription started with ${LIVE_TRANSCRIPTION_MODEL}`)
         } catch (liveError) {
           addLog(`Realtime unavailable; using standard transcription: ${liveError}`, 'error')
         }
@@ -472,7 +457,7 @@ function App() {
       invoke('play_sound', { sound: 'error' }).catch(() => {})
       await showSettingsWindow()
     }
-  }, [addLog, apiKey, clearHideTimer, hideWindow, model, prompt, realtimeTranscriptionEnabled, resetWaveform, showOverlayWindow, showRecordingOverlay, showSettingsWindow, startAudioPolling, status])
+  }, [addLog, apiKey, clearHideTimer, hideWindow, prompt, realtimeTranscriptionEnabled, resetWaveform, showOverlayWindow, showRecordingOverlay, showSettingsWindow, startAudioPolling, status])
 
   const stopRecording = useCallback(async () => {
     if (!isRecordingStatus(status)) return
@@ -493,6 +478,7 @@ function App() {
       addLog(postProcessEnabled ? 'Finishing transcript with post-processing' : 'Finishing transcript')
 
       let result: TranscriptionResult
+      let transcriptionModel = FILE_TRANSCRIPTION_MODEL
       if (liveTranscriptionStartedRef.current) {
         try {
           const liveTranscript = await invoke<string>('finish_live_transcription')
@@ -502,13 +488,13 @@ function App() {
             postProcessEnabled,
             postProcessPrompt: postProcessPrompt || null,
           })
+          transcriptionModel = LIVE_TRANSCRIPTION_MODEL
           addLog('Realtime transcript completed')
         } catch (liveError) {
           addLog(`Realtime transcription failed; retrying from saved audio: ${liveError}`, 'error')
           result = await invoke<TranscriptionResult>('transcribe', {
             audioPath,
             apiKey,
-            model: model || null,
             prompt: prompt || null,
             postProcessEnabled,
             postProcessPrompt: postProcessPrompt || null,
@@ -520,7 +506,6 @@ function App() {
         result = await invoke<TranscriptionResult>('transcribe', {
           audioPath,
           apiKey,
-          model: model || null,
           prompt: prompt || null,
           postProcessEnabled,
           postProcessPrompt: postProcessPrompt || null,
@@ -532,7 +517,7 @@ function App() {
       }
 
       setTranscript(result.transcript)
-      addTranscriptToHistory(result.transcript, result.post_process_applied)
+      addTranscriptToHistory(result.transcript, transcriptionModel, result.post_process_applied)
       await writeText(result.transcript)
       await invoke('set_tray_status', { status: 'success' })
       addLog(result.post_process_applied ? 'Cleaned transcript copied to clipboard' : 'Transcript copied to clipboard', 'success')
@@ -571,7 +556,7 @@ function App() {
         scheduleHide(5000)
       }
     }
-  }, [addLog, addTranscriptToHistory, apiKey, clearHideTimer, clearLevelPolling, model, postProcessEnabled, postProcessPrompt, prompt, scheduleHide, showOverlayWindow, showRecordingOverlay, showSettingsWindow, status])
+  }, [addLog, addTranscriptToHistory, apiKey, clearHideTimer, clearLevelPolling, postProcessEnabled, postProcessPrompt, prompt, scheduleHide, showOverlayWindow, showRecordingOverlay, showSettingsWindow, status])
 
   const cancelRecording = useCallback(async () => {
     if (!isRecordingStatus(status)) return
@@ -875,17 +860,7 @@ function App() {
                   onChange={(event) => handleApiKeyChange(event.target.value)}
                 />
 
-                <label className="field-label" htmlFor="transcription-model">Audio model</label>
-                <select
-                  id="transcription-model"
-                  className="field-input"
-                  value={model}
-                  onChange={(event) => handleModelChange(event.target.value)}
-                >
-                  <option value="whisper-1">whisper-1 — classic</option>
-                  <option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe — faster, lower cost</option>
-                  <option value="gpt-4o-transcribe">gpt-4o-transcribe — best quality</option>
-                </select>
+                <p className="body-hint">Recorded audio uses <code>{FILE_TRANSCRIPTION_MODEL}</code>. Live transcription uses <code>{LIVE_TRANSCRIPTION_MODEL}</code> when enabled.</p>
               </section>
 
               <section className="panel-block" aria-labelledby="behavior-heading">
@@ -910,7 +885,7 @@ function App() {
                   />
                   <span>
                     <strong>Transcribe while recording</strong>
-                    <small>Reduces the wait after stopping. whisper-1 uses gpt-4o-mini-transcribe in this mode.</small>
+                    <small>Reduces the wait after stopping with {LIVE_TRANSCRIPTION_MODEL}.</small>
                   </span>
                 </label>
               </section>

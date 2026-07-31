@@ -8,11 +8,11 @@ use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 const REALTIME_URL: &str = "wss://api.openai.com/v1/realtime?intent=transcription";
 const TARGET_SAMPLE_RATE: u32 = 24_000;
 const TRANSCRIPTION_LANGUAGE: &str = "en";
+const LIVE_TRANSCRIPTION_MODEL: &str = "gpt-live-transcribe";
 
 /// Streams microphone chunks to OpenAI and returns the final transcript when the producer closes.
 pub async fn transcribe_audio_stream(
     api_key: String,
-    model: String,
     prompt: String,
     source_sample_rate: u32,
     audio: Receiver<Vec<f32>>,
@@ -32,7 +32,7 @@ pub async fn transcribe_audio_stream(
         .map_err(|error| format!("Realtime API connection failed: {error}"))?;
     let (mut writer, mut reader) = socket.split();
 
-    let transcription = transcription_settings(&model, &prompt);
+    let transcription = transcription_settings(&prompt);
 
     writer
         .send(Message::Text(
@@ -44,10 +44,7 @@ pub async fn transcribe_audio_stream(
                         "input": {
                             "format": { "type": "audio/pcm", "rate": TARGET_SAMPLE_RATE },
                             "transcription": transcription,
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "silence_duration_ms": 500
-                            }
+                            "turn_detection": null
                         }
                     }
                 }
@@ -138,16 +135,12 @@ pub async fn transcribe_audio_stream(
     }
 }
 
-fn transcription_settings(model: &str, prompt: &str) -> Value {
-    let selected_model = match model {
-        "gpt-4o-transcribe" => "gpt-4o-transcribe",
-        _ => "gpt-4o-mini-transcribe",
-    };
+fn transcription_settings(prompt: &str) -> Value {
     let mut transcription = json!({
-        "model": selected_model,
+        "model": LIVE_TRANSCRIPTION_MODEL,
         // Scribe currently records English dictation only. This prevents the model from
         // interpreting uncertain speech or trailing room noise as another language.
-        "language": TRANSCRIPTION_LANGUAGE,
+        "languages": [TRANSCRIPTION_LANGUAGE],
     });
     if !prompt.trim().is_empty() {
         transcription["prompt"] = Value::String(prompt.to_string());
@@ -193,10 +186,10 @@ mod tests {
 
     #[test]
     fn transcription_settings_are_english_without_an_implicit_prompt() {
-        let settings = transcription_settings("gpt-4o-mini-transcribe", "");
+        let settings = transcription_settings("");
 
-        assert_eq!(settings["model"], "gpt-4o-mini-transcribe");
-        assert_eq!(settings["language"], "en");
+        assert_eq!(settings["model"], LIVE_TRANSCRIPTION_MODEL);
+        assert_eq!(settings["languages"], json!([TRANSCRIPTION_LANGUAGE]));
         assert!(settings.get("prompt").is_none());
     }
 

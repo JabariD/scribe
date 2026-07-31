@@ -23,7 +23,6 @@ use tauri::{
 #[derive(Serialize, Deserialize, Default)]
 struct Config {
     api_key: Option<String>, // legacy; migrated to macOS Keychain on read
-    model: Option<String>,
     show_recording_overlay: Option<bool>,
     realtime_transcription_enabled: Option<bool>,
     prompt: Option<String>,
@@ -38,6 +37,11 @@ struct TranscriptionResult {
     post_process_error: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct FileTranscriptionResponse {
+    text: String,
+}
+
 #[derive(Default)]
 struct LiveTranscriptionState {
     result: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<Result<String, String>>>>,
@@ -48,7 +52,18 @@ const KEYCHAIN_ACCOUNT_OPENAI_API_KEY: &str = "openai-api-key";
 const POST_PROCESS_MODEL: &str = "gpt-4o-mini";
 const TRANSCRIPTION_LANGUAGE: &str = "en";
 const DEFAULT_POST_PROCESS_PROMPT: &str = "Clean up this voice transcript. Remove filler words like um, uh, ah, and you know. Fix punctuation, capitalization, spelling, and grammar. Preserve the speaker's meaning, wording, tone, and formatting as much as possible. Return only the cleaned transcript.";
-const MAX_RECORDING_DURATION: Duration = Duration::from_secs(10 * 60);
+// Keep mono PCM16 WAV uploads below the Transcriptions API's 25 MB limit.
+const MAX_TRANSCRIPTION_FILE_BYTES: u64 = 24_000_000;
+const WAV_BYTES_PER_SAMPLE: u64 = 2;
+
+fn max_recording_duration(sample_rate: u32) -> Duration {
+    let bytes_per_second = u64::from(sample_rate).saturating_mul(WAV_BYTES_PER_SAMPLE);
+    let seconds = MAX_TRANSCRIPTION_FILE_BYTES
+        .checked_div(bytes_per_second)
+        .unwrap_or(0)
+        .max(1);
+    Duration::from_secs(seconds)
+}
 
 fn get_config_path() -> PathBuf {
     let config_dir = dirs::config_dir()
@@ -204,20 +219,6 @@ fn set_api_key(api_key: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_model() -> String {
-    load_config()
-        .model
-        .unwrap_or_else(|| "whisper-1".to_string())
-}
-
-#[tauri::command]
-fn set_model(model: String) {
-    let mut config = load_config();
-    config.model = Some(model);
-    save_config(&config);
-}
-
-#[tauri::command]
 fn get_show_recording_overlay() -> bool {
     load_config().show_recording_overlay.unwrap_or(true)
 }
@@ -286,7 +287,6 @@ async fn start_live_transcription(
     state: tauri::State<'_, Arc<RecordingState>>,
     live_state: tauri::State<'_, LiveTranscriptionState>,
     api_key: String,
-    model: String,
     prompt: String,
 ) -> Result<(), String> {
     if !state.is_active() {
@@ -304,8 +304,7 @@ async fn start_live_transcription(
     *current_result = Some(result_receiver);
 
     tauri::async_runtime::spawn(async move {
-        let result =
-            realtime::transcribe_audio_stream(api_key, model, prompt, sample_rate, audio).await;
+        let result = realtime::transcribe_audio_stream(api_key, prompt, sample_rate, audio).await;
         let _ = result_sender.send(result);
     });
 
@@ -454,9 +453,10 @@ fn start_recording(
 
         let _ = ready_tx.send(Ok(()));
         let started_at = Instant::now();
+        let max_duration = max_recording_duration(config.sample_rate().0);
 
         while state_clone.is_active() {
-            if started_at.elapsed() >= MAX_RECORDING_DURATION {
+            if started_at.elapsed() >= max_duration {
                 state_clone.stop();
                 if let Some(window) = handle.get_window("main") {
                     window.emit("recording-time-limit-reached", ()).ok();
@@ -651,7 +651,6 @@ async fn post_process_transcript(
 async fn transcribe(
     audio_path: String,
     api_key: String,
-    model: Option<String>,
     prompt: Option<String>,
     post_process_enabled: Option<bool>,
     post_process_prompt: Option<String>,
@@ -675,17 +674,9 @@ async fn transcribe(
         .mime_str("audio/wav")
         .map_err(|e| e.to_string())?;
 
-    // Validate model — only allow known transcription models
-    let selected_model = match model.as_deref().unwrap_or("whisper-1") {
-        "gpt-4o-transcribe" => "gpt-4o-transcribe",
-        "gpt-4o-mini-transcribe" => "gpt-4o-mini-transcribe",
-        _ => "whisper-1",
-    };
-
     let mut form = reqwest::multipart::Form::new()
-        .text("model", selected_model)
-        .text("language", TRANSCRIPTION_LANGUAGE)
-        .text("response_format", "text")
+        .text("model", "gpt-transcribe")
+        .text("languages[]", TRANSCRIPTION_LANGUAGE)
         .part("file", part);
 
     // Add prompt for technical term recognition (e.g., code terms, proper nouns)
@@ -710,9 +701,10 @@ async fn transcribe(
     }
 
     let transcript = response
-        .text()
+        .json::<FileTranscriptionResponse>()
         .await
-        .map_err(|e| format!("Failed to read response: {e}"))?
+        .map_err(|e| format!("Failed to read transcription response: {e}"))?
+        .text
         .trim()
         .to_string();
 
@@ -824,8 +816,6 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_api_key,
             set_api_key,
-            get_model,
-            set_model,
             get_show_recording_overlay,
             set_show_recording_overlay,
             get_realtime_transcription_enabled,
@@ -854,4 +844,16 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recording_duration_stays_below_the_upload_limit() {
+        let duration = max_recording_duration(48_000);
+        assert_eq!(duration, Duration::from_secs(250));
+        assert!(duration.as_secs() * 48_000 * WAV_BYTES_PER_SAMPLE < 25_000_000);
+    }
 }
