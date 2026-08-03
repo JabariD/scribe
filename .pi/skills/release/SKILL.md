@@ -5,7 +5,7 @@ Release workflow for Scribe. No GitHub Actions - agent runs tests, builds, and u
 ## Quick Release
 
 ```bash
-cd ~/Documents/code/scribe
+cd ~/Documents/Code/scribe
 
 # 1. Bump version in all three files
 #    - package.json
@@ -20,10 +20,11 @@ npm run tauri build
 
 # 4. Create release artifacts
 cd src-tauri/target/release/bundle/macos
-zip -r Scribe_X.X.X_aarch64.zip Scribe.app
+ditto -c -k --sequesterRsrc --keepParent Scribe.app Scribe_X.X.X_aarch64.zip
 cd -
 
 # 5. Commit, tag, push
+# Include both updated lockfiles: package-lock.json and src-tauri/Cargo.lock.
 git add -A
 git commit -m "chore: bump version to X.X.X"
 git push origin main
@@ -38,9 +39,9 @@ gh release create vX.X.X \
 
 ## Version Files
 
-All three must match:
-- `package.json` → `"version": "X.X.X"`
-- `src-tauri/Cargo.toml` → `version = "X.X.X"`
+These release metadata files must match:
+- `package.json` and `package-lock.json` → `"version": "X.X.X"`
+- `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` → `version = "X.X.X"`
 - `src-tauri/tauri.conf.json` → `"version": "X.X.X"`
 
 ## Build Outputs
@@ -54,7 +55,9 @@ All three must match:
 ## Local Install
 
 ```bash
-cp -r src-tauri/target/release/bundle/macos/Scribe.app /Applications/
+pkill -x Scribe 2>/dev/null || true
+rm -rf /Applications/Scribe.app
+cp -R src-tauri/target/release/bundle/macos/Scribe.app /Applications/Scribe.app
 ```
 
 ## GitHub Releases
