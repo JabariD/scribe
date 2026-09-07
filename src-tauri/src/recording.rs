@@ -1,6 +1,11 @@
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+
+pub struct LiveAudioStream {
+    pub initial_samples: Vec<f32>,
+    pub receiver: Receiver<Vec<f32>>,
+}
 
 /// Core recording state machine - manages recording, pause, and audio data
 pub struct RecordingState {
@@ -10,6 +15,7 @@ pub struct RecordingState {
     pub samples: Mutex<Vec<f32>>,
     pub sample_rate: Mutex<u32>,
     live_audio_sender: Mutex<Option<SyncSender<Vec<f32>>>>,
+    live_audio_dropped_samples: AtomicU64,
 }
 
 impl Default for RecordingState {
@@ -21,6 +27,7 @@ impl Default for RecordingState {
             samples: Mutex::new(Vec::new()),
             sample_rate: Mutex::new(44100),
             live_audio_sender: Mutex::new(None),
+            live_audio_dropped_samples: AtomicU64::new(0),
         }
     }
 }
@@ -30,6 +37,7 @@ impl RecordingState {
     pub fn start(&self) {
         self.samples.lock().clear();
         self.live_audio_sender.lock().take();
+        self.live_audio_dropped_samples.store(0, Ordering::SeqCst);
         self.is_recording.store(true, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
     }
@@ -53,14 +61,27 @@ impl RecordingState {
     }
 
     /// Send captured audio to a bounded realtime consumer without blocking the microphone callback.
-    pub fn start_live_audio(&self) -> Receiver<Vec<f32>> {
+    pub fn start_live_audio(&self) -> LiveAudioStream {
+        // Lock samples before installing the sender. The audio callback uses the same
+        // lock order, so every sample is either in this snapshot or sent afterward.
+        let samples = self.samples.lock();
         let (sender, receiver) = mpsc::sync_channel(64);
         *self.live_audio_sender.lock() = Some(sender);
-        receiver
+        let initial_samples = samples.clone();
+        drop(samples);
+
+        LiveAudioStream {
+            initial_samples,
+            receiver,
+        }
     }
 
     pub fn stop_live_audio(&self) {
         self.live_audio_sender.lock().take();
+    }
+
+    pub fn live_audio_dropped_samples(&self) -> u64 {
+        self.live_audio_dropped_samples.load(Ordering::SeqCst)
     }
 
     /// Toggle pause state - returns new paused state
@@ -104,7 +125,10 @@ impl RecordingState {
 
         if let Some(sender) = self.live_audio_sender.lock().as_ref() {
             // Dropping a chunk is safer than blocking the real-time audio callback.
-            let _ = sender.try_send(data.to_vec());
+            if sender.try_send(data.to_vec()).is_err() {
+                self.live_audio_dropped_samples
+                    .fetch_add(data.len() as u64, Ordering::SeqCst);
+            }
         }
     }
 
@@ -250,5 +274,30 @@ mod tests {
         state.stop();
 
         assert!(!state.is_paused());
+    }
+
+    #[test]
+    fn live_audio_includes_samples_captured_before_attachment() {
+        let state = RecordingState::default();
+        state.start();
+        state.push_samples(&[0.1, 0.2, 0.3]);
+
+        let live_audio = state.start_live_audio();
+
+        assert_eq!(live_audio.initial_samples, vec![0.1, 0.2, 0.3]);
+        assert_eq!(state.live_audio_dropped_samples(), 0);
+    }
+
+    #[test]
+    fn live_audio_overflow_is_reported_for_batch_fallback() {
+        let state = RecordingState::default();
+        state.start();
+        let _live_audio = state.start_live_audio();
+
+        for _ in 0..65 {
+            state.push_samples(&[0.25]);
+        }
+
+        assert_eq!(state.live_audio_dropped_samples(), 1);
     }
 }

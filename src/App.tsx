@@ -31,6 +31,12 @@ type TranscriptionResult = {
   post_process_error: string | null
 }
 
+type RecordingPruneResult = {
+  deleted_count: number
+  freed_bytes: number
+  failed_count: number
+}
+
 const DEFAULT_POST_PROCESS_PROMPT = `Clean up this voice transcript. Remove filler words like um, uh, ah, and you know. Fix punctuation, capitalization, spelling, and grammar. Preserve the speaker's meaning, wording, tone, and formatting as much as possible. Return only the cleaned transcript.`
 const SETTINGS_WINDOW_SIZE = { width: 400, height: 620 }
 const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
@@ -144,6 +150,8 @@ function App() {
   const hideTimerRef = useRef<number | null>(null)
   const waveformFrameRef = useRef(0)
   const liveTranscriptionStartedRef = useRef(false)
+  const transitionInProgressRef = useRef(false)
+  const settingSaveTimersRef = useRef<Record<string, number>>({})
 
   const addLog = useCallback((message: string, level: AppLogLevel = 'info') => {
     const now = new Date()
@@ -159,9 +167,59 @@ function App() {
     ].slice(0, APP_LOG_LIMIT))
   }, [])
 
+  const pruneStoredRecordings = useCallback(async (retentionDays: number) => {
+    try {
+      const result = await invoke<RecordingPruneResult>('prune_recordings', { retentionDays })
+      if (result.deleted_count > 0) {
+        const freedMegabytes = (result.freed_bytes / 1_000_000).toFixed(1)
+        addLog(`Deleted ${result.deleted_count} expired recordings (${freedMegabytes} MB)`, 'success')
+      }
+      if (result.failed_count > 0) {
+        addLog(`Could not delete ${result.failed_count} expired recordings`, 'error')
+      }
+    } catch (pruneError) {
+      addLog(`Failed to apply recording retention: ${pruneError}`, 'error')
+    }
+  }, [addLog])
+
+  const persistSetting = useCallback(async (
+    label: string,
+    command: string,
+    args: Record<string, unknown>,
+  ) => {
+    try {
+      await invoke(command, args)
+    } catch (saveError) {
+      const message = `Failed to save ${label}: ${saveError}`
+      setError(message)
+      addLog(message, 'error')
+    }
+  }, [addLog])
+
+  const scheduleSettingSave = useCallback((
+    key: string,
+    label: string,
+    command: string,
+    args: Record<string, unknown>,
+  ) => {
+    const pendingTimer = settingSaveTimersRef.current[key]
+    if (pendingTimer !== undefined) window.clearTimeout(pendingTimer)
+
+    settingSaveTimersRef.current[key] = window.setTimeout(() => {
+      delete settingSaveTimersRef.current[key]
+      persistSetting(label, command, args)
+    }, 350)
+  }, [persistSetting])
+
   const saveTranscriptHistory = useCallback((nextHistory: TranscriptHistoryEntry[]) => {
-    window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(nextHistory))
-  }, [])
+    try {
+      window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(nextHistory))
+    } catch (storageError) {
+      const message = `Failed to save transcript history: ${storageError}`
+      setError(message)
+      addLog(message, 'error')
+    }
+  }, [addLog])
 
   const addTranscriptToHistory = useCallback((nextTranscript: string, model: string, postProcessApplied: boolean) => {
     const trimmedTranscript = nextTranscript.trim()
@@ -185,14 +243,22 @@ function App() {
   const handleHistoryRetentionChange = useCallback((value: number) => {
     const nextRetentionDays = normalizeRetentionDays(value)
     setHistoryRetentionDays(nextRetentionDays)
-    window.localStorage.setItem(HISTORY_RETENTION_STORAGE_KEY, String(nextRetentionDays))
+    try {
+      window.localStorage.setItem(HISTORY_RETENTION_STORAGE_KEY, String(nextRetentionDays))
+    } catch (storageError) {
+      const message = `Failed to save history retention: ${storageError}`
+      setError(message)
+      addLog(message, 'error')
+    }
 
     setTranscriptHistory((currentHistory) => {
       const nextHistory = pruneHistory(currentHistory, nextRetentionDays)
       saveTranscriptHistory(nextHistory)
       return nextHistory
     })
-  }, [saveTranscriptHistory])
+
+    pruneStoredRecordings(nextRetentionDays)
+  }, [addLog, pruneStoredRecordings, saveTranscriptHistory])
 
   const clearHistory = useCallback(() => {
     setTranscriptHistory([])
@@ -299,9 +365,31 @@ function App() {
   useEffect(() => {
     addLog('Scribe ready')
 
-    const savedRetentionDays = normalizeRetentionDays(Number(window.localStorage.getItem(HISTORY_RETENTION_STORAGE_KEY) ?? DEFAULT_HISTORY_RETENTION_DAYS))
-    const savedHistory = window.localStorage.getItem(HISTORY_STORAGE_KEY)
+    const reportLoadError = (label: string, loadError: unknown) => {
+      const message = `Failed to load ${label}: ${loadError}`
+      setError(message)
+      addLog(message, 'error')
+    }
+
+    let savedRetentionDays = DEFAULT_HISTORY_RETENTION_DAYS
+    let savedHistory: string | null = null
+    let canApplySavedRetention = true
+    try {
+      const savedRetention = window.localStorage.getItem(HISTORY_RETENTION_STORAGE_KEY)
+      const parsedRetention = Number(savedRetention ?? DEFAULT_HISTORY_RETENTION_DAYS)
+      if (!Number.isFinite(parsedRetention)) {
+        canApplySavedRetention = false
+        reportLoadError('history retention', 'saved value is invalid')
+      } else {
+        savedRetentionDays = normalizeRetentionDays(parsedRetention)
+      }
+      savedHistory = window.localStorage.getItem(HISTORY_STORAGE_KEY)
+    } catch (storageError) {
+      canApplySavedRetention = false
+      reportLoadError('local history', storageError)
+    }
     setHistoryRetentionDays(savedRetentionDays)
+    if (canApplySavedRetention) pruneStoredRecordings(savedRetentionDays)
 
     if (savedHistory) {
       try {
@@ -309,7 +397,8 @@ function App() {
         const nextHistory = pruneHistory(parsedHistory, savedRetentionDays)
         setTranscriptHistory(nextHistory)
         saveTranscriptHistory(nextHistory)
-      } catch {
+      } catch (historyError) {
+        reportLoadError('transcript history', historyError)
         setTranscriptHistory([])
         saveTranscriptHistory([])
       }
@@ -317,94 +406,71 @@ function App() {
 
     invoke<string>('get_api_key').then((key) => {
       if (key) setApiKey(key)
-    }).catch(() => {})
+    }).catch((loadError) => reportLoadError('API key', loadError))
 
     invoke<boolean>('get_show_recording_overlay').then((savedPreference) => {
       setShowRecordingOverlay(savedPreference)
-    }).catch(() => {})
+    }).catch((loadError) => reportLoadError('recording HUD preference', loadError))
 
     invoke<boolean>('get_realtime_transcription_enabled').then((savedPreference) => {
       setRealtimeTranscriptionEnabled(savedPreference)
-    }).catch(() => {})
+    }).catch((loadError) => reportLoadError('realtime transcription preference', loadError))
 
     invoke<string>('get_prompt').then((savedPrompt) => {
       setPrompt(savedPrompt)
-    }).catch(() => {})
+    }).catch((loadError) => reportLoadError('vocabulary hints', loadError))
 
     invoke<boolean>('get_post_process_enabled').then((savedPreference) => {
       setPostProcessEnabled(savedPreference)
-    }).catch(() => {})
+    }).catch((loadError) => reportLoadError('post-processing preference', loadError))
 
     invoke<string>('get_post_process_prompt').then((savedPrompt) => {
       if (savedPrompt) setPostProcessPrompt(savedPrompt)
-    }).catch(() => {})
-  }, [addLog, saveTranscriptHistory])
+    }).catch((loadError) => reportLoadError('post-processing prompt', loadError))
+  }, [addLog, pruneStoredRecordings, saveTranscriptHistory])
 
   useEffect(() => {
     return () => {
       clearLevelPolling()
       clearHideTimer()
+      Object.values(settingSaveTimersRef.current).forEach((timer) => window.clearTimeout(timer))
     }
   }, [clearHideTimer, clearLevelPolling])
 
-  const handleApiKeyChange = async (key: string) => {
+  const handleApiKeyChange = (key: string) => {
     setApiKey(key)
-    try {
-      await invoke('set_api_key', { apiKey: key })
-    } catch (saveError) {
-      console.error('Failed to save API key:', saveError)
-    }
+    scheduleSettingSave('api-key', 'API key', 'set_api_key', { apiKey: key })
   }
 
   const handleShowRecordingOverlayChange = async (enabled: boolean) => {
     setShowRecordingOverlay(enabled)
-    try {
-      await invoke('set_show_recording_overlay', { showRecordingOverlay: enabled })
-    } catch (saveError) {
-      console.error('Failed to save overlay preference:', saveError)
-    }
+    await persistSetting('recording HUD preference', 'set_show_recording_overlay', { showRecordingOverlay: enabled })
   }
 
   const handleRealtimeTranscriptionChange = async (enabled: boolean) => {
     setRealtimeTranscriptionEnabled(enabled)
     addLog(enabled ? 'Realtime transcription enabled' : 'Realtime transcription disabled')
-    try {
-      await invoke('set_realtime_transcription_enabled', { realtimeTranscriptionEnabled: enabled })
-    } catch (saveError) {
-      console.error('Failed to save realtime transcription preference:', saveError)
-    }
+    await persistSetting('realtime transcription preference', 'set_realtime_transcription_enabled', { realtimeTranscriptionEnabled: enabled })
   }
 
-  const handlePromptChange = async (nextPrompt: string) => {
+  const handlePromptChange = (nextPrompt: string) => {
     setPrompt(nextPrompt)
-    try {
-      await invoke('set_prompt', { prompt: nextPrompt })
-    } catch (saveError) {
-      console.error('Failed to save vocabulary hints:', saveError)
-    }
+    scheduleSettingSave('prompt', 'vocabulary hints', 'set_prompt', { prompt: nextPrompt })
   }
 
   const handlePostProcessEnabledChange = async (enabled: boolean) => {
     setPostProcessEnabled(enabled)
     addLog(enabled ? 'Post-processing enabled' : 'Post-processing disabled')
-    try {
-      await invoke('set_post_process_enabled', { postProcessEnabled: enabled })
-    } catch (saveError) {
-      console.error('Failed to save post-processing preference:', saveError)
-    }
+    await persistSetting('post-processing preference', 'set_post_process_enabled', { postProcessEnabled: enabled })
   }
 
-  const handlePostProcessPromptChange = async (nextPrompt: string) => {
+  const handlePostProcessPromptChange = (nextPrompt: string) => {
     setPostProcessPrompt(nextPrompt)
-    try {
-      await invoke('set_post_process_prompt', { postProcessPrompt: nextPrompt })
-    } catch (saveError) {
-      console.error('Failed to save post-processing prompt:', saveError)
-    }
+    scheduleSettingSave('post-process-prompt', 'post-processing prompt', 'set_post_process_prompt', { postProcessPrompt: nextPrompt })
   }
 
   const startRecording = useCallback(async () => {
-    if (status === 'recording') return
+    if (status === 'recording' || transitionInProgressRef.current) return
 
     clearHideTimer()
 
@@ -418,22 +484,31 @@ function App() {
       return
     }
 
+    transitionInProgressRef.current = true
+
     setError('')
     setTranscript('')
     setAudioLevel(0)
     resetWaveform()
 
+    let recordingStarted = false
+
     try {
       await invoke('start_recording')
+      recordingStarted = true
       liveTranscriptionStartedRef.current = false
       if (realtimeTranscriptionEnabled) {
         try {
-          await invoke('start_live_transcription', {
+          const bufferedMilliseconds = await invoke<number>('start_live_transcription', {
             apiKey,
             prompt,
           })
           liveTranscriptionStartedRef.current = true
-          addLog(`Realtime transcription started with ${LIVE_TRANSCRIPTION_MODEL}`)
+          addLog(
+            bufferedMilliseconds > 0
+              ? `Realtime transcription started with ${bufferedMilliseconds} ms of buffered audio`
+              : `Realtime transcription started with ${LIVE_TRANSCRIPTION_MODEL}`,
+          )
         } catch (liveError) {
           addLog(`Realtime unavailable; using standard transcription: ${liveError}`, 'error')
         }
@@ -448,6 +523,12 @@ function App() {
       }
       startAudioPolling()
     } catch (recordingError) {
+      invoke('unregister_escape_hotkey').catch(() => {})
+      if (liveTranscriptionStartedRef.current) {
+        await invoke('cancel_live_transcription').catch(() => {})
+        liveTranscriptionStartedRef.current = false
+      }
+      if (recordingStarted) await invoke('cancel_recording').catch(() => {})
       const message = `Failed to start recording: ${recordingError}`
       setError(message)
       setStatus('error')
@@ -456,11 +537,15 @@ function App() {
       invoke('set_tray_status', { status: 'error' }).catch(() => {})
       invoke('play_sound', { sound: 'error' }).catch(() => {})
       await showSettingsWindow()
+    } finally {
+      transitionInProgressRef.current = false
     }
   }, [addLog, apiKey, clearHideTimer, hideWindow, prompt, realtimeTranscriptionEnabled, resetWaveform, showOverlayWindow, showRecordingOverlay, showSettingsWindow, startAudioPolling, status])
 
   const stopRecording = useCallback(async () => {
-    if (!isRecordingStatus(status)) return
+    if (!isRecordingStatus(status) || transitionInProgressRef.current) return
+
+    transitionInProgressRef.current = true
 
     clearHideTimer()
     invoke('unregister_escape_hotkey').catch(() => {})
@@ -518,6 +603,7 @@ function App() {
 
       setTranscript(result.transcript)
       addTranscriptToHistory(result.transcript, transcriptionModel, result.post_process_applied)
+      pruneStoredRecordings(historyRetentionDays)
       await writeText(result.transcript)
       await invoke('set_tray_status', { status: 'success' })
       addLog(result.post_process_applied ? 'Cleaned transcript copied to clipboard' : 'Transcript copied to clipboard', 'success')
@@ -555,11 +641,15 @@ function App() {
         })
         scheduleHide(5000)
       }
+    } finally {
+      transitionInProgressRef.current = false
     }
-  }, [addLog, addTranscriptToHistory, apiKey, clearHideTimer, clearLevelPolling, postProcessEnabled, postProcessPrompt, prompt, scheduleHide, showOverlayWindow, showRecordingOverlay, showSettingsWindow, status])
+  }, [addLog, addTranscriptToHistory, apiKey, clearHideTimer, clearLevelPolling, historyRetentionDays, postProcessEnabled, postProcessPrompt, prompt, pruneStoredRecordings, scheduleHide, showOverlayWindow, showRecordingOverlay, showSettingsWindow, status])
 
   const cancelRecording = useCallback(async () => {
-    if (!isRecordingStatus(status)) return
+    if (!isRecordingStatus(status) || transitionInProgressRef.current) return
+
+    transitionInProgressRef.current = true
 
     clearHideTimer()
     invoke('unregister_escape_hotkey').catch(() => {})
@@ -574,19 +664,25 @@ function App() {
 
     try {
       await invoke('cancel_recording')
+      setError('')
+      setStatus('idle')
+      setViewMode('settings')
+      addLog('Recording canceled')
+      await hideWindow()
     } catch (cancelError) {
-      console.error('Failed to cancel recording:', cancelError)
+      const message = `Failed to cancel recording: ${cancelError}`
+      setError(message)
+      setStatus('error')
+      addLog(message, 'error')
+    } finally {
+      transitionInProgressRef.current = false
     }
-
-    setError('')
-    setStatus('idle')
-    setViewMode('settings')
-    addLog('Recording canceled')
-    await hideWindow()
   }, [addLog, clearHideTimer, clearLevelPolling, hideWindow, resetWaveform, status])
 
   const togglePause = useCallback(async () => {
-    if (!isRecordingStatus(status)) return
+    if (!isRecordingStatus(status) || transitionInProgressRef.current) return
+
+    transitionInProgressRef.current = true
 
     try {
       const paused = await invoke<boolean>('pause_recording')
@@ -596,9 +692,13 @@ function App() {
         resetWaveform(0)
       }
     } catch (pauseError) {
-      console.error('Failed to toggle pause:', pauseError)
+      const message = `Failed to toggle pause: ${pauseError}`
+      setError(message)
+      addLog(message, 'error')
+    } finally {
+      transitionInProgressRef.current = false
     }
-  }, [resetWaveform, status])
+  }, [addLog, resetWaveform, status])
 
   const toggleRecording = useCallback(() => {
     if (isRecordingStatus(status)) {
@@ -944,12 +1044,12 @@ function App() {
                 <div className="panel-block-head">
                   <h2 id="history-heading">History</h2>
                   <button type="button" className="text-button" onClick={clearHistory} disabled={transcriptHistory.length === 0}>
-                    Clear
+                    Clear text history
                   </button>
                 </div>
-                <p className="body-hint">Previous transcriptions, stored locally on this Mac.</p>
+                <p className="body-hint">Previous transcriptions and source audio are stored locally on this Mac.</p>
 
-                <label className="field-label" htmlFor="history-retention-days">Expire after (days)</label>
+                <label className="field-label" htmlFor="history-retention-days">Expire text and audio after (days)</label>
                 <div className="inline-field">
                   <input
                     id="history-retention-days"

@@ -15,7 +15,7 @@ I wanted something simple: hotkey → speak → clipboard. No subscriptions, no 
 - **Auto-clipboard**: Transcriptions copied automatically
 - **Optional realtime mode**: Process speech while recording to reduce the wait after stopping
 - **Optional cleanup pass**: Remove filler words and fix punctuation, spelling, and grammar before copying
-- **Local history**: Previous transcripts are saved locally with configurable expiration
+- **Local history**: Previous transcripts and source recordings use the same configurable expiration
 
 ## Install
 
@@ -56,10 +56,10 @@ Requires: Node.js 18+, Rust, Xcode CLI tools
 
 ## File Locations
 
-- **Audio recordings**: `~/Library/VoiceTranscripts/`
+- **Audio recordings**: `~/Library/VoiceTranscripts/` (timestamped Scribe recordings follow the History retention setting)
 - **API key**: macOS Keychain
 - **Config**: `~/Library/Application Support/scribe/config.json`
-- **Transcript history**: Stored locally in the app webview storage
+- **Transcript history**: Stored locally in the app webview storage and expired alongside source audio
 
 ## Tech Stack
 
@@ -83,5 +83,5 @@ Transcription cost depends on the selected OpenAI transcription workflow. See Op
 - [ ] Local transcription with whisper.cpp (offline mode)
 - [ ] Auto-stop on silence (VAD)
 - [ ] Context-aware corrections
-- [ ] History view
+- [x] History view
 - [ ] Custom hotkey configuration

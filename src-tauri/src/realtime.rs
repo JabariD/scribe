@@ -15,6 +15,7 @@ pub async fn transcribe_audio_stream(
     api_key: String,
     prompt: String,
     source_sample_rate: u32,
+    initial_audio: Vec<f32>,
     audio: Receiver<Vec<f32>>,
 ) -> Result<String, String> {
     let mut request = REALTIME_URL
@@ -27,9 +28,13 @@ pub async fn transcribe_audio_stream(
             .map_err(|error| format!("Invalid API key header: {error}"))?,
     );
 
-    let (socket, _) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|error| format!("Realtime API connection failed: {error}"))?;
+    let (socket, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    .map_err(|_| "Realtime API connection timed out".to_string())?
+    .map_err(|error| format!("Realtime API connection failed: {error}"))?;
     let (mut writer, mut reader) = socket.split();
 
     let transcription = transcription_settings(&prompt);
@@ -54,6 +59,8 @@ pub async fn transcribe_audio_stream(
         .await
         .map_err(|error| format!("Failed to configure realtime transcription: {error}"))?;
 
+    append_audio(&mut writer, &initial_audio, source_sample_rate).await?;
+
     let mut completed_transcript = String::new();
     let mut current_delta = String::new();
     let mut producer_closed = false;
@@ -67,12 +74,7 @@ pub async fn transcribe_audio_stream(
                 loop {
                     match audio.try_recv() {
                         Ok(chunk) => {
-                            let pcm = resample_to_pcm16(&chunk, source_sample_rate, TARGET_SAMPLE_RATE);
-                            if pcm.is_empty() { continue; }
-                            writer.send(Message::Text(json!({
-                                "type": "input_audio_buffer.append",
-                                "audio": BASE64.encode(pcm)
-                            }).to_string())).await.map_err(|error| format!("Failed to stream audio: {error}"))?;
+                            append_audio(&mut writer, &chunk, source_sample_rate).await?;
                         }
                         Err(TryRecvError::Empty) => break,
                         Err(TryRecvError::Disconnected) => {
@@ -133,6 +135,32 @@ pub async fn transcribe_audio_stream(
     } else {
         Ok(transcript)
     }
+}
+
+async fn append_audio<S>(
+    writer: &mut S,
+    samples: &[f32],
+    source_sample_rate: u32,
+) -> Result<(), String>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let pcm = resample_to_pcm16(samples, source_sample_rate, TARGET_SAMPLE_RATE);
+    if pcm.is_empty() {
+        return Ok(());
+    }
+
+    writer
+        .send(Message::Text(
+            json!({
+                "type": "input_audio_buffer.append",
+                "audio": BASE64.encode(pcm)
+            })
+            .to_string(),
+        ))
+        .await
+        .map_err(|error| format!("Failed to stream audio: {error}"))
 }
 
 fn transcription_settings(prompt: &str) -> Value {

@@ -22,10 +22,10 @@ cd src-tauri && cargo test  # Rust tests
 - Recording overlay can be disabled; when disabled, dictation stays minimized unless Scribe needs attention
 - Tray icon: `src-tauri/icons/icon.png` is a transparent monochrome macOS template image (`iconAsTemplate: true`). Do not replace it with a full-color or opaque app icon, macOS renders its alpha silhouette as a solid menu-bar shape.
 - Tray status: 🔴 recording, ⏳ processing, ✅ success, ❌ error
-- Audio saved to `~/Library/VoiceTranscripts/`
+- Audio saved to `~/Library/VoiceTranscripts/`; timestamped Scribe WAVs are pruned using the transcript-history retention setting (0 keeps them indefinitely)
 - API key stored in macOS Keychain (`com.scribe.app` / `openai-api-key`)
 - Settings stored in `~/Library/Application Support/scribe/config.json` (`show_recording_overlay`, `realtime_transcription_enabled`, `prompt`, `post_process_enabled`, `post_process_prompt`; legacy `api_key` is migrated to Keychain on read)
-- Transcript history is stored locally in the Tauri webview `localStorage` with user-configurable day-based retention
+- Transcript history is stored locally in the Tauri webview `localStorage`; its user-configurable day-based retention also applies to timestamped Scribe WAVs
 
 ## Release
 Read `.pi/skills/release/SKILL.md` before creating a release.

@@ -11,16 +11,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs::{self, File};
 use std::io::BufWriter;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tauri::{
     CustomMenuItem, GlobalShortcutManager, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu,
     SystemTrayMenuItem,
 };
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct Config {
     api_key: Option<String>, // legacy; migrated to macOS Keychain on read
     show_recording_overlay: Option<bool>,
@@ -35,6 +35,13 @@ struct TranscriptionResult {
     transcript: String,
     post_process_applied: bool,
     post_process_error: Option<String>,
+}
+
+#[derive(Serialize, Default)]
+struct RecordingPruneResult {
+    deleted_count: u64,
+    freed_bytes: u64,
+    failed_count: u64,
 }
 
 #[derive(Deserialize)]
@@ -55,6 +62,9 @@ const DEFAULT_POST_PROCESS_PROMPT: &str = "Clean up this voice transcript. Remov
 // Keep mono PCM16 WAV uploads below the Transcriptions API's 25 MB limit.
 const MAX_TRANSCRIPTION_FILE_BYTES: u64 = 24_000_000;
 const WAV_BYTES_PER_SAMPLE: u64 = 2;
+const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+static CONFIG_IO_LOCK: StdMutex<()> = StdMutex::new(());
 
 fn max_recording_duration(sample_rate: u32) -> Duration {
     let bytes_per_second = u64::from(sample_rate).saturating_mul(WAV_BYTES_PER_SAMPLE);
@@ -65,40 +75,130 @@ fn max_recording_duration(sample_rate: u32) -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn get_config_path() -> PathBuf {
+fn api_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(API_CONNECT_TIMEOUT)
+        .timeout(API_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| format!("Failed to configure OpenAI client: {error}"))
+}
+
+fn get_config_path() -> Result<PathBuf, String> {
     let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
+        .ok_or_else(|| "Could not locate the macOS Application Support directory".to_string())?
         .join("scribe");
-    fs::create_dir_all(&config_dir).ok();
-    config_dir.join("config.json")
+    fs::create_dir_all(&config_dir)
+        .map_err(|error| format!("Failed to create config directory: {error}"))?;
+    Ok(config_dir.join("config.json"))
 }
 
-fn load_config() -> Config {
-    let path = get_config_path();
-    if path.exists() {
-        fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
-    } else {
-        Config::default()
+fn load_config_from(path: &Path) -> Result<Config, String> {
+    if !path.exists() {
+        return Ok(Config::default());
     }
+
+    let contents =
+        fs::read_to_string(path).map_err(|error| format!("Failed to read config: {error}"))?;
+    serde_json::from_str(&contents).map_err(|error| format!("Failed to parse config: {error}"))
 }
 
-fn save_config(config: &Config) {
-    let path = get_config_path();
-    if let Ok(json) = serde_json::to_string_pretty(config) {
-        fs::write(path, json).ok();
-    }
+fn load_config() -> Result<Config, String> {
+    let _guard = CONFIG_IO_LOCK
+        .lock()
+        .map_err(|_| "Config lock was poisoned".to_string())?;
+    load_config_from(&get_config_path()?)
 }
 
-fn get_transcripts_dir() -> PathBuf {
+fn save_config_to(path: &Path, config: &Config) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(config)
+        .map_err(|error| format!("Failed to encode config: {error}"))?;
+    let temporary_path = path.with_extension("json.tmp");
+    fs::write(&temporary_path, json).map_err(|error| format!("Failed to write config: {error}"))?;
+    fs::rename(&temporary_path, path).map_err(|error| format!("Failed to replace config: {error}"))
+}
+
+fn update_config(update: impl FnOnce(&mut Config)) -> Result<(), String> {
+    let _guard = CONFIG_IO_LOCK
+        .lock()
+        .map_err(|_| "Config lock was poisoned".to_string())?;
+    let path = get_config_path()?;
+    let mut config = load_config_from(&path)?;
+    update(&mut config);
+    save_config_to(&path, &config)
+}
+
+fn get_transcripts_dir() -> Result<PathBuf, String> {
     let dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
+        .ok_or_else(|| "Could not locate the macOS home directory".to_string())?
         .join("Library")
         .join("VoiceTranscripts");
-    fs::create_dir_all(&dir).ok();
-    dir
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("Failed to create recordings directory: {error}"))?;
+    Ok(dir)
+}
+
+fn recording_timestamp(path: &Path) -> Option<chrono::NaiveDateTime> {
+    let stem = path.file_stem()?.to_str()?;
+    chrono::NaiveDateTime::parse_from_str(stem, "%Y%m%d_%H%M%S").ok()
+}
+
+fn prune_recordings_in(
+    directory: &Path,
+    retention_days: u32,
+    now: chrono::NaiveDateTime,
+) -> Result<RecordingPruneResult, String> {
+    let mut result = RecordingPruneResult::default();
+    if retention_days == 0 {
+        return Ok(result);
+    }
+
+    let cutoff = now - chrono::Duration::days(i64::from(retention_days));
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("Failed to read recordings directory: {error}"))?;
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                result.failed_count += 1;
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("wav") {
+            continue;
+        }
+        let Some(timestamp) = recording_timestamp(&path) else {
+            continue;
+        };
+        if timestamp >= cutoff {
+            continue;
+        }
+
+        let bytes = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                result.deleted_count += 1;
+                result.freed_bytes = result.freed_bytes.saturating_add(bytes);
+            }
+            Err(_) => result.failed_count += 1,
+        }
+    }
+
+    Ok(result)
+}
+
+#[tauri::command]
+fn prune_recordings(retention_days: u32) -> Result<RecordingPruneResult, String> {
+    if retention_days > 3_650 {
+        return Err("Recording retention must be between 0 and 3650 days".to_string());
+    }
+
+    prune_recordings_in(
+        &get_transcripts_dir()?,
+        retention_days,
+        chrono::Local::now().naive_local(),
+    )
 }
 
 fn get_api_key_from_keychain() -> Option<String> {
@@ -195,91 +295,80 @@ fn play_sound(sound: String) {
 }
 
 #[tauri::command]
-fn get_api_key() -> String {
+fn get_api_key() -> Result<String, String> {
     if let Some(api_key) = get_api_key_from_keychain() {
-        return api_key;
+        return Ok(api_key);
     }
 
-    let mut config = load_config();
-    let legacy_api_key = config.api_key.take().unwrap_or_default();
+    let config = load_config()?;
+    let legacy_api_key = config.api_key.unwrap_or_default();
     if !legacy_api_key.is_empty() && set_api_key_in_keychain(&legacy_api_key).is_ok() {
-        save_config(&config);
+        update_config(|config| config.api_key = None)?;
     }
-    legacy_api_key
+    Ok(legacy_api_key)
 }
 
 #[tauri::command]
 fn set_api_key(api_key: String) -> Result<(), String> {
     set_api_key_in_keychain(&api_key)?;
 
-    let mut config = load_config();
-    config.api_key = None;
-    save_config(&config);
-    Ok(())
+    update_config(|config| config.api_key = None)
 }
 
 #[tauri::command]
-fn get_show_recording_overlay() -> bool {
-    load_config().show_recording_overlay.unwrap_or(true)
+fn get_show_recording_overlay() -> Result<bool, String> {
+    Ok(load_config()?.show_recording_overlay.unwrap_or(true))
 }
 
 #[tauri::command]
-fn set_show_recording_overlay(show_recording_overlay: bool) {
-    let mut config = load_config();
-    config.show_recording_overlay = Some(show_recording_overlay);
-    save_config(&config);
+fn set_show_recording_overlay(show_recording_overlay: bool) -> Result<(), String> {
+    update_config(|config| config.show_recording_overlay = Some(show_recording_overlay))
 }
 
 #[tauri::command]
-fn get_realtime_transcription_enabled() -> bool {
-    load_config()
+fn get_realtime_transcription_enabled() -> Result<bool, String> {
+    Ok(load_config()?
         .realtime_transcription_enabled
-        .unwrap_or(false)
+        .unwrap_or(false))
 }
 
 #[tauri::command]
-fn set_realtime_transcription_enabled(realtime_transcription_enabled: bool) {
-    let mut config = load_config();
-    config.realtime_transcription_enabled = Some(realtime_transcription_enabled);
-    save_config(&config);
+fn set_realtime_transcription_enabled(realtime_transcription_enabled: bool) -> Result<(), String> {
+    update_config(|config| {
+        config.realtime_transcription_enabled = Some(realtime_transcription_enabled)
+    })
 }
 
 #[tauri::command]
-fn get_prompt() -> String {
-    load_config().prompt.unwrap_or_default()
+fn get_prompt() -> Result<String, String> {
+    Ok(load_config()?.prompt.unwrap_or_default())
 }
 
 #[tauri::command]
-fn set_prompt(prompt: String) {
-    let mut config = load_config();
-    config.prompt = Some(prompt);
-    save_config(&config);
+fn set_prompt(prompt: String) -> Result<(), String> {
+    update_config(|config| config.prompt = Some(prompt))
 }
 
 #[tauri::command]
-fn get_post_process_enabled() -> bool {
-    load_config().post_process_enabled.unwrap_or(false)
+fn get_post_process_enabled() -> Result<bool, String> {
+    Ok(load_config()?.post_process_enabled.unwrap_or(false))
 }
 
 #[tauri::command]
-fn set_post_process_enabled(post_process_enabled: bool) {
-    let mut config = load_config();
-    config.post_process_enabled = Some(post_process_enabled);
-    save_config(&config);
+fn set_post_process_enabled(post_process_enabled: bool) -> Result<(), String> {
+    update_config(|config| config.post_process_enabled = Some(post_process_enabled))
 }
 
 #[tauri::command]
-fn get_post_process_prompt() -> String {
-    load_config()
+fn get_post_process_prompt() -> Result<String, String> {
+    Ok(load_config()?
         .post_process_prompt
-        .unwrap_or_else(|| DEFAULT_POST_PROCESS_PROMPT.to_string())
+        .unwrap_or_else(|| DEFAULT_POST_PROCESS_PROMPT.to_string()))
 }
 
 #[tauri::command]
-fn set_post_process_prompt(post_process_prompt: String) {
-    let mut config = load_config();
-    config.post_process_prompt = Some(post_process_prompt);
-    save_config(&config);
+fn set_post_process_prompt(post_process_prompt: String) -> Result<(), String> {
+    update_config(|config| config.post_process_prompt = Some(post_process_prompt))
 }
 
 #[tauri::command]
@@ -288,7 +377,7 @@ async fn start_live_transcription(
     live_state: tauri::State<'_, LiveTranscriptionState>,
     api_key: String,
     prompt: String,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     if !state.is_active() {
         return Err("Start recording before realtime transcription".into());
     }
@@ -300,19 +389,32 @@ async fn start_live_transcription(
 
     let audio = state.start_live_audio();
     let sample_rate = *state.sample_rate.lock();
+    let buffered_milliseconds = if sample_rate == 0 {
+        0
+    } else {
+        (audio.initial_samples.len() as u64).saturating_mul(1_000) / u64::from(sample_rate)
+    };
     let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
     *current_result = Some(result_receiver);
 
     tauri::async_runtime::spawn(async move {
-        let result = realtime::transcribe_audio_stream(api_key, prompt, sample_rate, audio).await;
+        let result = realtime::transcribe_audio_stream(
+            api_key,
+            prompt,
+            sample_rate,
+            audio.initial_samples,
+            audio.receiver,
+        )
+        .await;
         let _ = result_sender.send(result);
     });
 
-    Ok(())
+    Ok(buffered_milliseconds)
 }
 
 #[tauri::command]
 async fn finish_live_transcription(
+    state: tauri::State<'_, Arc<RecordingState>>,
     live_state: tauri::State<'_, LiveTranscriptionState>,
 ) -> Result<String, String> {
     let result_receiver = live_state
@@ -321,6 +423,13 @@ async fn finish_live_transcription(
         .await
         .take()
         .ok_or_else(|| "Realtime transcription is not active".to_string())?;
+
+    let dropped_samples = state.live_audio_dropped_samples();
+    if dropped_samples > 0 {
+        return Err(format!(
+            "Realtime audio stream dropped {dropped_samples} samples; using saved recording"
+        ));
+    }
 
     tokio::time::timeout(Duration::from_secs(10), result_receiver)
         .await
@@ -523,7 +632,7 @@ fn stop_recording(
     // Generate filename with timestamp
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let filename = format!("{timestamp}.wav");
-    let filepath = get_transcripts_dir().join(&filename);
+    let filepath = get_transcripts_dir()?.join(&filename);
 
     // Write WAV file
     let spec = hound::WavSpec {
@@ -655,7 +764,7 @@ async fn transcribe(
     post_process_enabled: Option<bool>,
     post_process_prompt: Option<String>,
 ) -> Result<TranscriptionResult, String> {
-    let client = reqwest::Client::new();
+    let client = api_client()?;
 
     // Read the audio file
     let audio_data = tokio::fs::read(&audio_path)
@@ -754,7 +863,7 @@ async fn finalize_live_transcript(
         });
     }
 
-    let client = reqwest::Client::new();
+    let client = api_client()?;
     finalize_transcript_internal(&client, &api_key, transcript, post_process_prompt).await
 }
 
@@ -838,6 +947,7 @@ fn main() {
             pause_recording,
             is_paused,
             get_audio_level,
+            prune_recordings,
             transcribe,
             play_sound,
             set_tray_status
@@ -849,11 +959,99 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn retention_test_dir() -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "scribe-test-{}-{unique}-{sequence}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn recording_duration_stays_below_the_upload_limit() {
         let duration = max_recording_duration(48_000);
         assert_eq!(duration, Duration::from_secs(250));
         assert!(duration.as_secs() * 48_000 * WAV_BYTES_PER_SAMPLE < 25_000_000);
+    }
+
+    #[test]
+    fn recording_retention_deletes_only_expired_scribe_wavs() {
+        let directory = retention_test_dir();
+        fs::create_dir_all(&directory).expect("create retention test directory");
+        let expired = directory.join("20240101_120000.wav");
+        let retained = directory.join("20240201_120000.wav");
+        let unrelated = directory.join("meeting.wav");
+        File::create(&expired).expect("create expired recording");
+        File::create(&retained).expect("create retained recording");
+        File::create(&unrelated).expect("create unrelated wav");
+
+        let now = chrono::NaiveDateTime::parse_from_str("20240215_120000", "%Y%m%d_%H%M%S")
+            .expect("parse test timestamp");
+        let result = prune_recordings_in(&directory, 30, now).expect("prune recordings");
+
+        assert_eq!(result.deleted_count, 1);
+        assert!(!expired.exists());
+        assert!(retained.exists());
+        assert!(unrelated.exists());
+
+        fs::remove_dir_all(&directory).expect("remove retention test directory");
+    }
+
+    #[test]
+    fn zero_retention_days_keeps_recordings() {
+        let directory = retention_test_dir();
+        fs::create_dir_all(&directory).expect("create retention test directory");
+        let recording = directory.join("20200101_120000.wav");
+        File::create(&recording).expect("create recording");
+        let now = chrono::NaiveDateTime::parse_from_str("20240215_120000", "%Y%m%d_%H%M%S")
+            .expect("parse test timestamp");
+
+        let result = prune_recordings_in(&directory, 0, now).expect("prune recordings");
+
+        assert_eq!(result.deleted_count, 0);
+        assert!(recording.exists());
+
+        fs::remove_dir_all(&directory).expect("remove retention test directory");
+    }
+
+    #[test]
+    fn config_save_is_atomic_and_round_trips() {
+        let directory = retention_test_dir();
+        fs::create_dir_all(&directory).expect("create config test directory");
+        let path = directory.join("config.json");
+        let config = Config {
+            show_recording_overlay: Some(false),
+            ..Config::default()
+        };
+
+        save_config_to(&path, &config).expect("save config");
+        let saved = load_config_from(&path).expect("load config");
+
+        assert_eq!(saved.show_recording_overlay, Some(false));
+        assert!(!path.with_extension("json.tmp").exists());
+
+        fs::remove_dir_all(&directory).expect("remove config test directory");
+    }
+
+    #[test]
+    fn invalid_config_is_reported_instead_of_resetting_to_defaults() {
+        let directory = retention_test_dir();
+        fs::create_dir_all(&directory).expect("create config test directory");
+        let path = directory.join("config.json");
+        fs::write(&path, "not json").expect("write invalid config");
+
+        let error = load_config_from(&path).expect_err("invalid config should fail");
+
+        assert!(error.contains("Failed to parse config"));
+
+        fs::remove_dir_all(&directory).expect("remove config test directory");
     }
 }
