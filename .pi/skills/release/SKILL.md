@@ -7,13 +7,14 @@ Release workflow for Scribe. No GitHub Actions - agent runs tests, builds, and u
 ```bash
 cd ~/Documents/Code/scribe
 
-# 1. Bump version in all three files
-#    - package.json
-#    - src-tauri/Cargo.toml  
+# 1. Bump version in all five release metadata files
+#    - package.json and package-lock.json
+#    - src-tauri/Cargo.toml and src-tauri/Cargo.lock
 #    - src-tauri/tauri.conf.json
 
 # 2. Run tests
-cd src-tauri && cargo test && cd ..
+npm run build
+cd src-tauri && cargo fmt --check && cargo test && cargo clippy --all-targets --all-features -- -D warnings && cd ..
 
 # 3. Build
 npm run tauri build
@@ -24,8 +25,10 @@ ditto -c -k --sequesterRsrc --keepParent Scribe.app Scribe_X.X.X_aarch64.zip
 cd -
 
 # 5. Commit, tag, push
-# Include both updated lockfiles: package-lock.json and src-tauri/Cargo.lock.
-git add -A
+# Review the worktree and stage only the intended release files. Include both
+# updated lockfiles: package-lock.json and src-tauri/Cargo.lock.
+git status --short
+git add <intended-files>
 git commit -m "chore: bump version to X.X.X"
 git push origin main
 
@@ -51,6 +54,19 @@ These release metadata files must match:
 | macOS .app | `src-tauri/target/release/bundle/macos/Scribe.app` |
 | DMG installer | `src-tauri/target/release/bundle/dmg/Scribe_X.X.X_aarch64.dmg` |
 | Zip bundle | Create manually from .app |
+
+### DMG fallback when Finder automation is unavailable
+
+If Tauri finishes the `.app` but its DMG step fails with Apple Events error `-1743`, create a standard drag-to-Applications image without Finder window decoration:
+
+```bash
+scribe_dmg_stage=$(mktemp -d /tmp/scribe-dmg.XXXXXX)
+ditto src-tauri/target/release/bundle/macos/Scribe.app "$scribe_dmg_stage/Scribe.app"
+ln -s /Applications "$scribe_dmg_stage/Applications"
+hdiutil create -volname Scribe -srcfolder "$scribe_dmg_stage" -ov -format UDZO \
+  src-tauri/target/release/bundle/dmg/Scribe_X.X.X_aarch64.dmg
+rm -rf "$scribe_dmg_stage"
+```
 
 ## Local Install
 
