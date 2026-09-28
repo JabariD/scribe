@@ -1,19 +1,21 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio;
+mod local;
 mod realtime;
 mod recording;
+mod sounds;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use local::LocalEngine;
 use recording::RecordingState;
 use security_framework::os::macos::keychain::SecKeychain;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::fs::{self, File};
-use std::io::BufWriter;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{mpsc, Arc, Mutex as StdMutex};
+use std::sync::{mpsc, Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{
     CustomMenuItem, GlobalShortcutManager, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu,
@@ -28,6 +30,27 @@ struct Config {
     prompt: Option<String>,
     post_process_enabled: Option<bool>,
     post_process_prompt: Option<String>,
+    transcription_provider: Option<TranscriptionProvider>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+enum TranscriptionProvider {
+    #[default]
+    Openai,
+    Local,
+}
+
+/// Everything the UI needs at launch, read from disk and Keychain once.
+#[derive(Serialize)]
+struct Settings {
+    api_key: String,
+    show_recording_overlay: bool,
+    realtime_transcription_enabled: bool,
+    prompt: String,
+    post_process_enabled: bool,
+    post_process_prompt: String,
+    transcription_provider: TranscriptionProvider,
 }
 
 #[derive(Serialize)]
@@ -59,28 +82,32 @@ const KEYCHAIN_ACCOUNT_OPENAI_API_KEY: &str = "openai-api-key";
 const POST_PROCESS_MODEL: &str = "gpt-4o-mini";
 const TRANSCRIPTION_LANGUAGE: &str = "en";
 const DEFAULT_POST_PROCESS_PROMPT: &str = "Clean up this voice transcript. Remove filler words like um, uh, ah, and you know. Fix punctuation, capitalization, spelling, and grammar. Preserve the speaker's meaning, wording, tone, and formatting as much as possible. Return only the cleaned transcript.";
-// Keep mono PCM16 WAV uploads below the Transcriptions API's 25 MB limit.
+// Keep mono 16 kHz PCM16 WAV uploads below the Transcriptions API's 25 MB limit.
 const MAX_TRANSCRIPTION_FILE_BYTES: u64 = 24_000_000;
 const WAV_BYTES_PER_SAMPLE: u64 = 2;
+const MAX_RECORDING_DURATION: Duration = Duration::from_secs(
+    MAX_TRANSCRIPTION_FILE_BYTES / (audio::TARGET_SAMPLE_RATE as u64 * WAV_BYTES_PER_SAMPLE),
+);
 const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+// Longer than a typical dictation, so the connection warmed at record start is still open.
+const API_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 static CONFIG_IO_LOCK: StdMutex<()> = StdMutex::new(());
 
-fn max_recording_duration(sample_rate: u32) -> Duration {
-    let bytes_per_second = u64::from(sample_rate).saturating_mul(WAV_BYTES_PER_SAMPLE);
-    let seconds = MAX_TRANSCRIPTION_FILE_BYTES
-        .checked_div(bytes_per_second)
-        .unwrap_or(0)
-        .max(1);
-    Duration::from_secs(seconds)
-}
-
-fn api_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+/// One client for the app's lifetime so HTTPS connections are reused instead of
+/// paying a TCP + TLS handshake on every transcription.
+fn api_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let client = reqwest::Client::builder()
         .connect_timeout(API_CONNECT_TIMEOUT)
-        .timeout(API_REQUEST_TIMEOUT)
+        .pool_idle_timeout(API_POOL_IDLE_TIMEOUT)
+        .tcp_keepalive(Duration::from_secs(30))
         .build()
-        .map_err(|error| format!("Failed to configure OpenAI client: {error}"))
+        .map_err(|error| format!("Failed to configure HTTP client: {error}"))?;
+    Ok(CLIENT.get_or_init(|| client))
 }
 
 fn get_config_path() -> Result<PathBuf, String> {
@@ -270,32 +297,18 @@ fn set_tray_status(app: tauri::AppHandle, status: String) {
     app.tray_handle().set_title(indicator).ok();
 }
 
-// Internal sound player (called from Rust)
-fn play_sound_internal(sound: &str) {
-    let sound_path = match sound {
-        "start" => "/System/Library/Sounds/Pop.aiff",
-        "stop" => "/System/Library/Sounds/Tink.aiff",
-        "success" => "/System/Library/Sounds/Glass.aiff",
-        "error" => "/System/Library/Sounds/Basso.aiff",
-        "cancel" => "/System/Library/Sounds/Funk.aiff",
-        "pause" => "/System/Library/Sounds/Morse.aiff",
-        _ => "/System/Library/Sounds/Pop.aiff",
-    };
-
-    let path = sound_path.to_string();
-    std::thread::spawn(move || {
-        Command::new("afplay").arg(path).output().ok();
-    });
-}
-
-// Play macOS system sounds (called from frontend)
-#[tauri::command]
-fn play_sound(sound: String) {
-    play_sound_internal(&sound);
+fn play_sound_internal(app: &tauri::AppHandle, sound: &'static str) {
+    app.run_on_main_thread(move || sounds::play_on_main_thread(sound))
+        .ok();
 }
 
 #[tauri::command]
-fn get_api_key() -> Result<String, String> {
+fn play_sound(app: tauri::AppHandle, sound: String) {
+    app.run_on_main_thread(move || sounds::play_on_main_thread(&sound))
+        .ok();
+}
+
+fn load_api_key() -> Result<String, String> {
     if let Some(api_key) = get_api_key_from_keychain() {
         return Ok(api_key);
     }
@@ -309,6 +322,23 @@ fn get_api_key() -> Result<String, String> {
 }
 
 #[tauri::command]
+fn get_settings() -> Result<Settings, String> {
+    let api_key = load_api_key()?;
+    let config = load_config()?;
+    Ok(Settings {
+        api_key,
+        show_recording_overlay: config.show_recording_overlay.unwrap_or(true),
+        realtime_transcription_enabled: config.realtime_transcription_enabled.unwrap_or(false),
+        prompt: config.prompt.unwrap_or_default(),
+        post_process_enabled: config.post_process_enabled.unwrap_or(false),
+        post_process_prompt: config
+            .post_process_prompt
+            .unwrap_or_else(|| DEFAULT_POST_PROCESS_PROMPT.to_string()),
+        transcription_provider: config.transcription_provider.unwrap_or_default(),
+    })
+}
+
+#[tauri::command]
 fn set_api_key(api_key: String) -> Result<(), String> {
     set_api_key_in_keychain(&api_key)?;
 
@@ -316,20 +346,8 @@ fn set_api_key(api_key: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_show_recording_overlay() -> Result<bool, String> {
-    Ok(load_config()?.show_recording_overlay.unwrap_or(true))
-}
-
-#[tauri::command]
 fn set_show_recording_overlay(show_recording_overlay: bool) -> Result<(), String> {
     update_config(|config| config.show_recording_overlay = Some(show_recording_overlay))
-}
-
-#[tauri::command]
-fn get_realtime_transcription_enabled() -> Result<bool, String> {
-    Ok(load_config()?
-        .realtime_transcription_enabled
-        .unwrap_or(false))
 }
 
 #[tauri::command]
@@ -340,18 +358,8 @@ fn set_realtime_transcription_enabled(realtime_transcription_enabled: bool) -> R
 }
 
 #[tauri::command]
-fn get_prompt() -> Result<String, String> {
-    Ok(load_config()?.prompt.unwrap_or_default())
-}
-
-#[tauri::command]
 fn set_prompt(prompt: String) -> Result<(), String> {
     update_config(|config| config.prompt = Some(prompt))
-}
-
-#[tauri::command]
-fn get_post_process_enabled() -> Result<bool, String> {
-    Ok(load_config()?.post_process_enabled.unwrap_or(false))
 }
 
 #[tauri::command]
@@ -360,15 +368,93 @@ fn set_post_process_enabled(post_process_enabled: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_post_process_prompt() -> Result<String, String> {
-    Ok(load_config()?
-        .post_process_prompt
-        .unwrap_or_else(|| DEFAULT_POST_PROCESS_PROMPT.to_string()))
+fn set_post_process_prompt(post_process_prompt: String) -> Result<(), String> {
+    update_config(|config| config.post_process_prompt = Some(post_process_prompt))
 }
 
 #[tauri::command]
-fn set_post_process_prompt(post_process_prompt: String) -> Result<(), String> {
-    update_config(|config| config.post_process_prompt = Some(post_process_prompt))
+fn set_transcription_provider(transcription_provider: TranscriptionProvider) -> Result<(), String> {
+    update_config(|config| config.transcription_provider = Some(transcription_provider))
+}
+
+#[tauri::command]
+fn get_local_model_status(
+    engine: tauri::State<'_, LocalEngine>,
+) -> Result<local::LocalModelStatus, String> {
+    engine.status()
+}
+
+#[tauri::command]
+async fn download_local_model(
+    window: tauri::Window,
+    engine: tauri::State<'_, LocalEngine>,
+) -> Result<(), String> {
+    engine
+        .download(api_client()?, |downloaded_bytes, total_bytes| {
+            window
+                .emit(
+                    "local-model-download-progress",
+                    local::DownloadProgress {
+                        downloaded_bytes,
+                        total_bytes,
+                    },
+                )
+                .ok();
+        })
+        .await
+}
+
+/// Opens the HTTPS connection to OpenAI while the user is still speaking, so the upload
+/// after they stop skips DNS, TCP, and TLS setup.
+#[tauri::command]
+fn prewarm_openai_connection() -> Result<(), String> {
+    let client = api_client()?;
+    tauri::async_runtime::spawn(async move {
+        client
+            .head("https://api.openai.com/v1/models")
+            .timeout(API_CONNECT_TIMEOUT)
+            .send()
+            .await
+            .ok();
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn start_local_transcription(
+    state: tauri::State<'_, Arc<RecordingState>>,
+    engine: tauri::State<'_, LocalEngine>,
+) -> Result<(), String> {
+    if !state.is_active() {
+        return Err("Start recording before local transcription".into());
+    }
+    if !engine.status()?.installed {
+        return Err("The local model is not downloaded. Download it in Settings.".into());
+    }
+    engine.start_session(Arc::clone(state.inner()));
+    Ok(())
+}
+
+#[tauri::command]
+async fn finish_local_transcription(app: tauri::AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<LocalEngine>().finish_session())
+        .await
+        .map_err(|error| format!("Local transcription task failed: {error}"))?
+}
+
+#[tauri::command]
+fn cancel_local_transcription(engine: tauri::State<'_, LocalEngine>) {
+    engine.cancel_session();
+}
+
+#[tauri::command]
+async fn transcribe_local(app: tauri::AppHandle, audio_path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<LocalEngine>()
+            .transcribe_file(Path::new(&audio_path))
+    })
+    .await
+    .map_err(|error| format!("Local transcription task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -466,7 +552,8 @@ fn unregister_escape_hotkey(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| format!("Failed to unregister escape: {e}"))
 }
 
-#[tauri::command]
+// Runs off the main thread so the window keeps animating while the microphone opens/closes.
+#[tauri::command(async)]
 fn start_recording(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<RecordingState>>,
@@ -562,10 +649,9 @@ fn start_recording(
 
         let _ = ready_tx.send(Ok(()));
         let started_at = Instant::now();
-        let max_duration = max_recording_duration(config.sample_rate().0);
 
         while state_clone.is_active() {
-            if started_at.elapsed() >= max_duration {
+            if started_at.elapsed() >= MAX_RECORDING_DURATION {
                 state_clone.stop();
                 if let Some(window) = handle.get_window("main") {
                     window.emit("recording-time-limit-reached", ()).ok();
@@ -582,7 +668,7 @@ fn start_recording(
     match ready_rx.recv_timeout(Duration::from_secs(2)) {
         Ok(Ok(())) => {
             app.tray_handle().set_title("🔴").ok();
-            play_sound_internal("start");
+            play_sound_internal(&app, "start");
             Ok(())
         }
         Ok(Err(error)) => {
@@ -602,7 +688,8 @@ fn get_audio_level(state: tauri::State<'_, Arc<RecordingState>>) -> f32 {
     state.get_audio_level()
 }
 
-#[tauri::command]
+// Runs off the main thread so the window keeps animating while the microphone opens/closes.
+#[tauri::command(async)]
 fn stop_recording(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<RecordingState>>,
@@ -613,10 +700,7 @@ fn stop_recording(
     app.tray_handle().set_title("").ok();
 
     // Play stop sound
-    play_sound_internal("stop");
-
-    // Small delay to ensure stream is fully stopped
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    play_sound_internal(&app, "stop");
 
     let sample_rate = *state.sample_rate.lock();
 
@@ -634,24 +718,10 @@ fn stop_recording(
     let filename = format!("{timestamp}.wav");
     let filepath = get_transcripts_dir()?.join(&filename);
 
-    // Write WAV file
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-
-    let file = File::create(&filepath).map_err(|e| e.to_string())?;
-    let mut writer =
-        hound::WavWriter::new(BufWriter::new(file), spec).map_err(|e| e.to_string())?;
-
-    for sample in &samples {
-        let amplitude = (sample * i16::MAX as f32) as i16;
-        writer.write_sample(amplitude).map_err(|e| e.to_string())?;
-    }
-
-    writer.finalize().map_err(|e| e.to_string())?;
+    audio::write_wav_16k(
+        &filepath,
+        &audio::resample(&samples, sample_rate, audio::TARGET_SAMPLE_RATE),
+    )?;
 
     Ok(filepath.to_string_lossy().to_string())
 }
@@ -671,7 +741,7 @@ fn cancel_recording(
     app.tray_handle().set_title("").ok();
 
     // Play cancel sound (subtle)
-    play_sound_internal("cancel");
+    play_sound_internal(&app, "cancel");
 
     Ok(())
 }
@@ -686,6 +756,7 @@ fn pause_recording(
     }
 
     let now_paused = state.toggle_pause();
+    play_sound_internal(&app, "pause");
 
     // Update tray indicator
     if now_paused {
@@ -715,6 +786,7 @@ async fn post_process_transcript(
     let response = client
         .post("https://api.openai.com/v1/chat/completions")
         .header("Authorization", format!("Bearer {api_key}"))
+        .timeout(API_REQUEST_TIMEOUT)
         .json(&json!({
             "model": POST_PROCESS_MODEL,
             "temperature": 0,
@@ -761,9 +833,7 @@ async fn transcribe(
     audio_path: String,
     api_key: String,
     prompt: Option<String>,
-    post_process_enabled: Option<bool>,
-    post_process_prompt: Option<String>,
-) -> Result<TranscriptionResult, String> {
+) -> Result<String, String> {
     let client = api_client()?;
 
     // Read the audio file
@@ -799,6 +869,7 @@ async fn transcribe(
     let response = client
         .post("https://api.openai.com/v1/audio/transcriptions")
         .header("Authorization", format!("Bearer {api_key}"))
+        .timeout(API_REQUEST_TIMEOUT)
         .multipart(form)
         .send()
         .await
@@ -809,32 +880,40 @@ async fn transcribe(
         return Err(format!("OpenAI API error: {error_text}"));
     }
 
-    let transcript = response
+    Ok(response
         .json::<FileTranscriptionResponse>()
         .await
         .map_err(|e| format!("Failed to read transcription response: {e}"))?
         .text
         .trim()
-        .to_string();
+        .to_string())
+}
 
-    if !post_process_enabled.unwrap_or(false) {
+/// Applies the optional OpenAI cleanup pass. Cleanup failures keep the raw transcript.
+#[tauri::command]
+async fn finalize_transcript(
+    transcript: String,
+    api_key: String,
+    post_process_enabled: bool,
+    post_process_prompt: Option<String>,
+) -> Result<TranscriptionResult, String> {
+    if !post_process_enabled {
         return Ok(TranscriptionResult {
             transcript,
             post_process_applied: false,
             post_process_error: None,
         });
     }
+    if api_key.trim().is_empty() {
+        return Ok(TranscriptionResult {
+            transcript,
+            post_process_applied: false,
+            post_process_error: Some("Post-processing needs an OpenAI API key".into()),
+        });
+    }
 
-    finalize_transcript_internal(&client, &api_key, transcript, post_process_prompt).await
-}
-
-async fn finalize_transcript_internal(
-    client: &reqwest::Client,
-    api_key: &str,
-    transcript: String,
-    post_process_prompt: Option<String>,
-) -> Result<TranscriptionResult, String> {
-    match post_process_transcript(client, api_key, &transcript, post_process_prompt).await {
+    let client = api_client()?;
+    match post_process_transcript(client, &api_key, &transcript, post_process_prompt).await {
         Ok(cleaned) => Ok(TranscriptionResult {
             transcript: cleaned,
             post_process_applied: true,
@@ -848,23 +927,31 @@ async fn finalize_transcript_internal(
     }
 }
 
+/// The settings panel fills the window, so it needs the native macOS shadow; the overlay
+/// pill floats inside a larger transparent window and draws its own CSS shadow, where the
+/// native one would add a second, rectangular shadow.
 #[tauri::command]
-async fn finalize_live_transcript(
-    transcript: String,
-    api_key: String,
-    post_process_enabled: bool,
-    post_process_prompt: Option<String>,
-) -> Result<TranscriptionResult, String> {
-    if !post_process_enabled {
-        return Ok(TranscriptionResult {
-            transcript,
-            post_process_applied: false,
-            post_process_error: None,
-        });
-    }
+fn set_window_shadow(window: tauri::Window, enabled: bool) -> Result<(), String> {
+    let ns_window = window.ns_window().map_err(|error| error.to_string())?;
+    set_native_shadow(ns_window, enabled);
+    Ok(())
+}
 
-    let client = api_client()?;
-    finalize_transcript_internal(&client, &api_key, transcript, post_process_prompt).await
+// objc 0.2's macros reference a `cargo-clippy` cfg that current rustc flags as unknown.
+#[allow(unexpected_cfgs)]
+fn set_native_shadow(ns_window: *mut std::ffi::c_void, enabled: bool) {
+    use objc::{msg_send, sel, sel_impl};
+    let ns_window = ns_window as *mut objc::runtime::Object;
+    let enabled = if enabled {
+        objc::runtime::YES
+    } else {
+        objc::runtime::NO
+    };
+    unsafe {
+        let _: () = msg_send![ns_window, setHasShadow: enabled];
+        // Recompute the shadow from the current (rounded, transparent) content.
+        let _: () = msg_send![ns_window, invalidateShadow];
+    }
 }
 
 fn main() {
@@ -876,10 +963,16 @@ fn main() {
     let system_tray = SystemTray::new().with_menu(tray_menu);
 
     let recording_state = Arc::new(RecordingState::default());
+    let local_engine = LocalEngine::new(
+        local::default_model_dir()
+            .expect("Could not locate the macOS Application Support directory"),
+    );
+    local_engine.start_idle_unloader();
 
     tauri::Builder::default()
         .manage(recording_state)
         .manage(LiveTranscriptionState::default())
+        .manage(local_engine)
         .system_tray(system_tray)
         .setup(|app| {
             // Register global shortcut from Rust (more reliable than JS)
@@ -923,22 +1016,25 @@ fn main() {
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
-            get_api_key,
+            get_settings,
             set_api_key,
-            get_show_recording_overlay,
             set_show_recording_overlay,
-            get_realtime_transcription_enabled,
             set_realtime_transcription_enabled,
-            get_prompt,
             set_prompt,
-            get_post_process_enabled,
             set_post_process_enabled,
-            get_post_process_prompt,
             set_post_process_prompt,
+            set_transcription_provider,
+            get_local_model_status,
+            download_local_model,
+            prewarm_openai_connection,
+            start_local_transcription,
+            finish_local_transcription,
+            cancel_local_transcription,
+            transcribe_local,
             start_live_transcription,
             finish_live_transcription,
             cancel_live_transcription,
-            finalize_live_transcript,
+            finalize_transcript,
             register_escape_hotkey,
             unregister_escape_hotkey,
             start_recording,
@@ -950,7 +1046,8 @@ fn main() {
             prune_recordings,
             transcribe,
             play_sound,
-            set_tray_status
+            set_tray_status,
+            set_window_shadow
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -959,6 +1056,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -977,9 +1075,27 @@ mod tests {
 
     #[test]
     fn recording_duration_stays_below_the_upload_limit() {
-        let duration = max_recording_duration(48_000);
-        assert_eq!(duration, Duration::from_secs(250));
-        assert!(duration.as_secs() * 48_000 * WAV_BYTES_PER_SAMPLE < 25_000_000);
+        assert_eq!(MAX_RECORDING_DURATION, Duration::from_secs(750));
+        let bytes = MAX_RECORDING_DURATION.as_secs()
+            * u64::from(audio::TARGET_SAMPLE_RATE)
+            * WAV_BYTES_PER_SAMPLE;
+        assert!(bytes < 25_000_000);
+    }
+
+    #[test]
+    fn missing_provider_defaults_to_openai_and_round_trips() {
+        let legacy: Config = serde_json::from_str(r#"{"prompt":"x"}"#).expect("parse legacy");
+        assert_eq!(
+            legacy.transcription_provider.unwrap_or_default(),
+            TranscriptionProvider::Openai
+        );
+
+        let local: Config =
+            serde_json::from_str(r#"{"transcription_provider":"local"}"#).expect("parse local");
+        assert_eq!(
+            local.transcription_provider,
+            Some(TranscriptionProvider::Local)
+        );
     }
 
     #[test]

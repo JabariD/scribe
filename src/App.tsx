@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, type MutableRefObject } from 'react'
 import { invoke } from '@tauri-apps/api/tauri'
 import { writeText } from '@tauri-apps/api/clipboard'
 import { sendNotification } from '@tauri-apps/api/notification'
@@ -7,8 +7,33 @@ import { appWindow, LogicalPosition, LogicalSize } from '@tauri-apps/api/window'
 
 type Status = 'idle' | 'recording' | 'paused' | 'processing' | 'success' | 'error'
 type ViewMode = 'settings' | 'overlay'
+// 'starting' covers the moment between the hotkey and the microphone opening.
+type OverlayState = 'starting' | Exclude<Status, 'idle'>
 type SettingsTab = 'record' | 'settings' | 'history' | 'log'
 type AppLogLevel = 'info' | 'success' | 'error'
+type TranscriptionProvider = 'openai' | 'local'
+
+type Settings = {
+  api_key: string
+  show_recording_overlay: boolean
+  realtime_transcription_enabled: boolean
+  prompt: string
+  post_process_enabled: boolean
+  post_process_prompt: string
+  transcription_provider: TranscriptionProvider
+}
+
+type LocalModelStatus = {
+  name: string
+  installed: boolean
+  downloading: boolean
+  total_bytes: number
+}
+
+type DownloadProgress = {
+  downloaded_bytes: number
+  total_bytes: number
+}
 
 type AppLogEntry = {
   id: number
@@ -45,9 +70,13 @@ const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: 'history', label: 'History' },
   { id: 'log', label: 'Log' },
 ]
-const OVERLAY_WINDOW_SIZE = { width: 760, height: 190 }
-const WAVEFORM_BAR_COUNT = 56
-const BASE_WAVEFORM_LEVEL = 0.08
+// The pill plus room for its shadow inside the transparent window.
+const OVERLAY_WINDOW_SIZE = { width: 380, height: 92 }
+const OVERLAY_EXIT_MS = 170
+const SUCCESS_HIDE_DELAY_MS = 1100
+const WAVEFORM_BAR_COUNT = 23
+const WAVEFORM_MAX_HEIGHT = 24
+const WAVEFORM_MIN_HEIGHT = 3
 const APP_LOG_LIMIT = 60
 const HISTORY_STORAGE_KEY = 'scribe.transcriptHistory'
 const HISTORY_RETENTION_STORAGE_KEY = 'scribe.historyRetentionDays'
@@ -55,6 +84,11 @@ const DEFAULT_HISTORY_RETENTION_DAYS = 30
 const MAX_HISTORY_ENTRIES = 200
 const FILE_TRANSCRIPTION_MODEL = 'gpt-transcribe'
 const LIVE_TRANSCRIPTION_MODEL = 'gpt-live-transcribe'
+const LOCAL_TRANSCRIPTION_MODEL = 'parakeet-tdt-0.6b-v3'
+
+function formatMegabytes(bytes: number) {
+  return `${Math.round(bytes / 1_000_000)} MB`
+}
 
 function pruneHistory(entries: TranscriptHistoryEntry[], retentionDays: number) {
   const sortedEntries = [...entries].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
@@ -87,21 +121,84 @@ function normalizeAudioLevel(level: number) {
   return Math.min(1, Math.pow(Math.max(level, 0) * 24, 0.6))
 }
 
-function createWaveform(level = 0, frame = 0) {
-  const normalized = normalizeAudioLevel(level)
-  const center = (WAVEFORM_BAR_COUNT - 1) / 2
+function wait(milliseconds: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds))
+}
 
-  return Array.from({ length: WAVEFORM_BAR_COUNT }, (_, index) => {
-    const distanceFromCenter = Math.abs(index - center) / center
-    const envelope = Math.pow(1 - distanceFromCenter, 1.35)
-    const primaryPulse = (Math.sin(frame * 0.55 + index * 0.72) + 1) / 2
-    const secondaryPulse = (Math.sin(frame * 0.24 + index * 0.31 + 1.4) + 1) / 2
-    const shimmer = primaryPulse * 0.7 + secondaryPulse * 0.3
-    const levelWithEnvelope = normalized * (0.22 + envelope * 0.78)
-    const animatedLevel = levelWithEnvelope * (0.35 + shimmer * 0.65)
+/**
+ * Voice-reactive bars drawn at display rate with direct DOM writes, so the overlay stays
+ * smooth without re-rendering React. Level rises fast and falls slowly, like a VU meter.
+ */
+function Waveform({ levelRef, state }: { levelRef: MutableRefObject<number>, state: OverlayState }) {
+  const barsRef = useRef<(HTMLSpanElement | null)[]>([])
+  const stateRef = useRef(state)
+  stateRef.current = state
 
-    return Math.min(1, BASE_WAVEFORM_LEVEL + animatedLevel)
-  })
+  useEffect(() => {
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    const heights = new Array(WAVEFORM_BAR_COUNT).fill(WAVEFORM_MIN_HEIGHT)
+    const startedAt = performance.now()
+    let smoothedLevel = 0
+    let frame = 0
+
+    const draw = (now: number) => {
+      const seconds = (now - startedAt) / 1000
+      const current = stateRef.current
+      const target = current === 'recording' ? normalizeAudioLevel(levelRef.current) : 0
+      smoothedLevel += (target - smoothedLevel) * (target > smoothedLevel ? 0.5 : 0.1)
+
+      barsRef.current.forEach((bar, index) => {
+        if (!bar) return
+        const position = index / (WAVEFORM_BAR_COUNT - 1)
+        const offset = position * 2 - 1
+        let goal = WAVEFORM_MIN_HEIGHT
+        if (current === 'recording') {
+          const envelope = Math.exp(-offset * offset * 2.4)
+          const shimmer = reduceMotion ? 1 : 0.62 + 0.38 * Math.abs(Math.sin(seconds * 7.5 + index * 1.7) * Math.sin(seconds * 2.3 + index * 0.45))
+          goal += (WAVEFORM_MAX_HEIGHT - WAVEFORM_MIN_HEIGHT) * smoothedLevel * envelope * shimmer
+        } else if (current === 'processing' && !reduceMotion) {
+          // A soft highlight sweeps across while the transcript is prepared.
+          const sweep = ((seconds * 0.9) % 1.6) - 0.3
+          const distance = position - sweep
+          goal += 7 * Math.exp(-(distance * distance) / 0.012)
+        }
+        heights[index] += (goal - heights[index]) * 0.3
+        bar.style.height = `${heights[index].toFixed(1)}px`
+      })
+      frame = window.requestAnimationFrame(draw)
+    }
+
+    frame = window.requestAnimationFrame(draw)
+    return () => window.cancelAnimationFrame(frame)
+  }, [levelRef])
+
+  return (
+    <div className={`pill-waveform ${state}`} aria-hidden="true">
+      {Array.from({ length: WAVEFORM_BAR_COUNT }, (_, index) => (
+        <span key={index} ref={(bar) => { barsRef.current[index] = bar }} className="pill-bar" />
+      ))}
+    </div>
+  )
+}
+
+function PauseIcon() {
+  return <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="3" width="2.6" height="10" rx="1" /><rect x="9.4" y="3" width="2.6" height="10" rx="1" /></svg>
+}
+
+function PlayIcon() {
+  return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.3v9.4a.8.8 0 0 0 1.2.7l7.4-4.7a.8.8 0 0 0 0-1.4L6.2 2.6A.8.8 0 0 0 5 3.3Z" /></svg>
+}
+
+function CloseIcon() {
+  return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 4.5l7 7m0-7l-7 7" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" /></svg>
+}
+
+function StopIcon() {
+  return <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" rx="2.2" /></svg>
+}
+
+function CheckIcon() {
+  return <svg viewBox="0 0 16 16" aria-hidden="true"><path className="check-path" d="M3.5 8.4l3 3 6-6.6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
 }
 
 function isRecordingStatus(status: Status) {
@@ -118,23 +215,13 @@ function shouldShowSettingsForError(message: string) {
   )
 }
 
-function ShortcutKeys({ keys }: { keys: string[] }) {
-  return (
-    <span className="shortcut-group" aria-hidden="true">
-      {keys.map((key) => (
-        <kbd key={key}>{key}</kbd>
-      ))}
-    </span>
-  )
-}
-
 function App() {
   const [status, setStatus] = useState<Status>('idle')
   const [viewMode, setViewMode] = useState<ViewMode>('settings')
   const [transcript, setTranscript] = useState<string>('')
   const [error, setError] = useState<string>('')
   const [audioLevel, setAudioLevel] = useState<number>(0)
-  const [waveform, setWaveform] = useState<number[]>(() => createWaveform(0))
+  const [overlayLeaving, setOverlayLeaving] = useState(false)
   const [apiKey, setApiKey] = useState<string>('')
   const [showRecordingOverlay, setShowRecordingOverlay] = useState<boolean>(true)
   const [realtimeTranscriptionEnabled, setRealtimeTranscriptionEnabled] = useState<boolean>(false)
@@ -145,11 +232,17 @@ function App() {
   const [transcriptHistory, setTranscriptHistory] = useState<TranscriptHistoryEntry[]>([])
   const [appLogs, setAppLogs] = useState<AppLogEntry[]>([])
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('record')
+  const [transcriptionProvider, setTranscriptionProvider] = useState<TranscriptionProvider>('openai')
+  const [localModelStatus, setLocalModelStatus] = useState<LocalModelStatus | null>(null)
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null)
 
   const levelIntervalRef = useRef<number | null>(null)
   const hideTimerRef = useRef<number | null>(null)
-  const waveformFrameRef = useRef(0)
+  const levelRef = useRef(0)
+  const viewModeRef = useRef<ViewMode>('settings')
+  const overlayVisibleRef = useRef(false)
   const liveTranscriptionStartedRef = useRef(false)
+  const localTranscriptionStartedRef = useRef(false)
   const transitionInProgressRef = useRef(false)
   const settingSaveTimersRef = useRef<Record<string, number>>({})
 
@@ -285,59 +378,77 @@ function App() {
     }
   }, [])
 
-  const resetWaveform = useCallback((level = 0) => {
-    waveformFrameRef.current = 0
-    setWaveform(createWaveform(level, waveformFrameRef.current))
+  const resetWaveform = useCallback(() => {
+    levelRef.current = 0
   }, [])
 
-  const pushWaveformLevel = useCallback((level: number) => {
-    waveformFrameRef.current += 1
-    setWaveform(createWaveform(level, waveformFrameRef.current))
+  const changeViewMode = useCallback((mode: ViewMode) => {
+    viewModeRef.current = mode
+    setViewMode(mode)
   }, [])
 
   const hideWindow = useCallback(async () => {
+    if (overlayVisibleRef.current) {
+      // Let the pill fade out before the window disappears.
+      overlayVisibleRef.current = false
+      setOverlayLeaving(true)
+      await wait(OVERLAY_EXIT_MS)
+    }
     await appWindow.setAlwaysOnTop(false)
     await appWindow.hide()
+    setOverlayLeaving(false)
   }, [])
 
   const showOverlayWindow = useCallback(async () => {
-    setViewMode('overlay')
+    changeViewMode('overlay')
+    setOverlayLeaving(false)
 
     const screenWidth = window.screen.availWidth || window.screen.width || OVERLAY_WINDOW_SIZE.width
     const screenTop = (window.screen as Screen & { availTop?: number }).availTop ?? 0
     const x = Math.max(0, Math.round((screenWidth - OVERLAY_WINDOW_SIZE.width) / 2))
-    const y = Math.max(24, screenTop + 24)
+    const y = Math.max(12, screenTop + 12)
 
-    await appWindow.setSize(new LogicalSize(OVERLAY_WINDOW_SIZE.width, OVERLAY_WINDOW_SIZE.height))
-    await appWindow.setPosition(new LogicalPosition(x, y))
-    await appWindow.setAlwaysOnTop(true)
+    if (!overlayVisibleRef.current) {
+      await Promise.all([
+        appWindow.setSize(new LogicalSize(OVERLAY_WINDOW_SIZE.width, OVERLAY_WINDOW_SIZE.height)),
+        appWindow.setPosition(new LogicalPosition(x, y)),
+        appWindow.setAlwaysOnTop(true),
+        invoke('set_window_shadow', { enabled: false }),
+      ])
+    }
+    overlayVisibleRef.current = true
     await appWindow.show()
-  }, [])
+  }, [changeViewMode])
 
   const showSettingsWindow = useCallback(async () => {
     clearHideTimer()
-    setViewMode('settings')
+    overlayVisibleRef.current = false
+    setOverlayLeaving(false)
+    changeViewMode('settings')
 
     const availableHeight = window.screen.availHeight || SETTINGS_WINDOW_SIZE.height
     const height = Math.min(SETTINGS_WINDOW_SIZE.height, Math.max(560, availableHeight - 56))
 
-    await appWindow.setAlwaysOnTop(false)
+    await Promise.all([
+      appWindow.setAlwaysOnTop(false),
+      invoke('set_window_shadow', { enabled: true }),
+    ])
     await appWindow.setSize(new LogicalSize(SETTINGS_WINDOW_SIZE.width, height))
     await appWindow.center()
     await appWindow.show()
     await appWindow.setFocus()
-  }, [clearHideTimer])
+  }, [changeViewMode, clearHideTimer])
 
   const returnToIdleAndHide = useCallback(async () => {
     clearHideTimer()
     clearLevelPolling()
+    invoke('set_tray_status', { status: 'idle' }).catch(() => {})
+    await hideWindow()
     setStatus('idle')
-    setViewMode('settings')
+    changeViewMode('settings')
     setAudioLevel(0)
     resetWaveform()
-    await invoke('set_tray_status', { status: 'idle' })
-    await hideWindow()
-  }, [clearHideTimer, clearLevelPolling, hideWindow, resetWaveform])
+  }, [changeViewMode, clearHideTimer, clearLevelPolling, hideWindow, resetWaveform])
 
   const scheduleHide = useCallback((delayMs: number) => {
     clearHideTimer()
@@ -354,13 +465,14 @@ function App() {
     levelIntervalRef.current = window.setInterval(async () => {
       try {
         const level = await invoke<number>('get_audio_level')
-        setAudioLevel(level)
-        pushWaveformLevel(level)
+        levelRef.current = level
+        // The overlay reads the ref at display rate; only the settings meter needs React state.
+        if (viewModeRef.current === 'settings') setAudioLevel(level)
       } catch {
         clearLevelPolling()
       }
     }, 50)
-  }, [clearLevelPolling, pushWaveformLevel])
+  }, [clearLevelPolling])
 
   useEffect(() => {
     addLog('Scribe ready')
@@ -404,30 +516,30 @@ function App() {
       }
     }
 
-    invoke<string>('get_api_key').then((key) => {
-      if (key) setApiKey(key)
-    }).catch((loadError) => reportLoadError('API key', loadError))
+    invoke<Settings>('get_settings').then((settings) => {
+      setApiKey(settings.api_key)
+      setShowRecordingOverlay(settings.show_recording_overlay)
+      setRealtimeTranscriptionEnabled(settings.realtime_transcription_enabled)
+      setPrompt(settings.prompt)
+      setPostProcessEnabled(settings.post_process_enabled)
+      if (settings.post_process_prompt) setPostProcessPrompt(settings.post_process_prompt)
+      setTranscriptionProvider(settings.transcription_provider)
+    }).catch((loadError) => reportLoadError('settings', loadError))
 
-    invoke<boolean>('get_show_recording_overlay').then((savedPreference) => {
-      setShowRecordingOverlay(savedPreference)
-    }).catch((loadError) => reportLoadError('recording HUD preference', loadError))
-
-    invoke<boolean>('get_realtime_transcription_enabled').then((savedPreference) => {
-      setRealtimeTranscriptionEnabled(savedPreference)
-    }).catch((loadError) => reportLoadError('realtime transcription preference', loadError))
-
-    invoke<string>('get_prompt').then((savedPrompt) => {
-      setPrompt(savedPrompt)
-    }).catch((loadError) => reportLoadError('vocabulary hints', loadError))
-
-    invoke<boolean>('get_post_process_enabled').then((savedPreference) => {
-      setPostProcessEnabled(savedPreference)
-    }).catch((loadError) => reportLoadError('post-processing preference', loadError))
-
-    invoke<string>('get_post_process_prompt').then((savedPrompt) => {
-      if (savedPrompt) setPostProcessPrompt(savedPrompt)
-    }).catch((loadError) => reportLoadError('post-processing prompt', loadError))
+    invoke<LocalModelStatus>('get_local_model_status')
+      .then(setLocalModelStatus)
+      .catch((loadError) => reportLoadError('local model status', loadError))
   }, [addLog, pruneStoredRecordings, saveTranscriptHistory])
+
+  useEffect(() => {
+    const unlisten = listen<DownloadProgress>('local-model-download-progress', (event) => {
+      setDownloadProgress(event.payload)
+    })
+
+    return () => {
+      unlisten.then((dispose) => dispose())
+    }
+  }, [])
 
   useEffect(() => {
     return () => {
@@ -453,6 +565,29 @@ function App() {
     await persistSetting('realtime transcription preference', 'set_realtime_transcription_enabled', { realtimeTranscriptionEnabled: enabled })
   }
 
+  const handleTranscriptionProviderChange = async (provider: TranscriptionProvider) => {
+    setTranscriptionProvider(provider)
+    addLog(provider === 'local' ? 'Using local transcription' : 'Using OpenAI transcription')
+    await persistSetting('transcription provider', 'set_transcription_provider', { transcriptionProvider: provider })
+  }
+
+  const downloadLocalModel = async () => {
+    setDownloadProgress({ downloaded_bytes: 0, total_bytes: localModelStatus?.total_bytes ?? 0 })
+    setLocalModelStatus((current) => current && { ...current, downloading: true })
+    addLog(`Downloading ${LOCAL_TRANSCRIPTION_MODEL}`)
+    try {
+      await invoke('download_local_model')
+      addLog('Local model downloaded', 'success')
+    } catch (downloadError) {
+      const message = `Failed to download local model: ${downloadError}`
+      setError(message)
+      addLog(message, 'error')
+    } finally {
+      setDownloadProgress(null)
+      invoke<LocalModelStatus>('get_local_model_status').then(setLocalModelStatus).catch(() => {})
+    }
+  }
+
   const handlePromptChange = (nextPrompt: string) => {
     setPrompt(nextPrompt)
     scheduleSettingSave('prompt', 'vocabulary hints', 'set_prompt', { prompt: nextPrompt })
@@ -474,10 +609,13 @@ function App() {
 
     clearHideTimer()
 
-    if (!apiKey) {
-      setError('Please enter your OpenAI API key first')
+    const setupError = transcriptionProvider === 'local'
+      ? (localModelStatus?.installed ? null : 'Download the local model in Settings first')
+      : (apiKey ? null : 'Please enter your OpenAI API key first')
+    if (setupError) {
+      setError(setupError)
       setStatus('error')
-      addLog('Missing OpenAI API key', 'error')
+      addLog(setupError, 'error')
       setSettingsTab('settings')
       await showSettingsWindow()
       invoke('play_sound', { sound: 'error' }).catch(() => {})
@@ -492,12 +630,27 @@ function App() {
     resetWaveform()
 
     let recordingStarted = false
+    // Show the overlay while the microphone opens instead of after.
+    const overlayShown = showRecordingOverlay ? showOverlayWindow() : Promise.resolve()
 
     try {
       await invoke('start_recording')
       recordingStarted = true
+      setStatus('recording')
+      startAudioPolling()
       liveTranscriptionStartedRef.current = false
-      if (realtimeTranscriptionEnabled) {
+      localTranscriptionStartedRef.current = false
+      if (transcriptionProvider === 'local') {
+        try {
+          await invoke('start_local_transcription')
+          localTranscriptionStartedRef.current = true
+        } catch (localError) {
+          addLog(`Local transcription will run after stopping: ${localError}`, 'error')
+        }
+      } else if (!realtimeTranscriptionEnabled) {
+        invoke('prewarm_openai_connection').catch(() => {})
+      }
+      if (transcriptionProvider === 'openai' && realtimeTranscriptionEnabled) {
         try {
           const bufferedMilliseconds = await invoke<number>('start_live_transcription', {
             apiKey,
@@ -514,19 +667,20 @@ function App() {
         }
       }
       await invoke('register_escape_hotkey')
-      setStatus('recording')
       addLog('Recording started')
-      if (showRecordingOverlay) {
-        await showOverlayWindow()
-      } else {
-        await hideWindow()
-      }
-      startAudioPolling()
+      await overlayShown
+      if (!showRecordingOverlay) await hideWindow()
     } catch (recordingError) {
+      clearLevelPolling()
+      await overlayShown.catch(() => {})
       invoke('unregister_escape_hotkey').catch(() => {})
       if (liveTranscriptionStartedRef.current) {
         await invoke('cancel_live_transcription').catch(() => {})
         liveTranscriptionStartedRef.current = false
+      }
+      if (localTranscriptionStartedRef.current) {
+        await invoke('cancel_local_transcription').catch(() => {})
+        localTranscriptionStartedRef.current = false
       }
       if (recordingStarted) await invoke('cancel_recording').catch(() => {})
       const message = `Failed to start recording: ${recordingError}`
@@ -540,7 +694,38 @@ function App() {
     } finally {
       transitionInProgressRef.current = false
     }
-  }, [addLog, apiKey, clearHideTimer, hideWindow, prompt, realtimeTranscriptionEnabled, resetWaveform, showOverlayWindow, showRecordingOverlay, showSettingsWindow, startAudioPolling, status])
+  }, [addLog, apiKey, clearHideTimer, clearLevelPolling, hideWindow, localModelStatus, prompt, realtimeTranscriptionEnabled, resetWaveform, showOverlayWindow, showRecordingOverlay, showSettingsWindow, startAudioPolling, status, transcriptionProvider])
+
+  // Returns the raw transcript and the model that produced it, preferring work already done
+  // during recording and falling back to the saved WAV.
+  const transcribeRecording = useCallback(async (audioPath: string): Promise<{ transcript: string, model: string }> => {
+    if (localTranscriptionStartedRef.current || transcriptionProvider === 'local') {
+      const startedDuringRecording = localTranscriptionStartedRef.current
+      localTranscriptionStartedRef.current = false
+      if (startedDuringRecording) {
+        try {
+          return { transcript: await invoke<string>('finish_local_transcription'), model: LOCAL_TRANSCRIPTION_MODEL }
+        } catch (localError) {
+          addLog(`Local transcription failed; retrying from saved audio: ${localError}`, 'error')
+        }
+      }
+      return { transcript: await invoke<string>('transcribe_local', { audioPath }), model: LOCAL_TRANSCRIPTION_MODEL }
+    }
+
+    if (liveTranscriptionStartedRef.current) {
+      liveTranscriptionStartedRef.current = false
+      try {
+        const transcript = await invoke<string>('finish_live_transcription')
+        addLog('Realtime transcript completed')
+        return { transcript, model: LIVE_TRANSCRIPTION_MODEL }
+      } catch (liveError) {
+        addLog(`Realtime transcription failed; retrying from saved audio: ${liveError}`, 'error')
+      }
+    }
+
+    const transcript = await invoke<string>('transcribe', { audioPath, apiKey, prompt: prompt || null })
+    return { transcript, model: FILE_TRANSCRIPTION_MODEL }
+  }, [addLog, apiKey, prompt, transcriptionProvider])
 
   const stopRecording = useCallback(async () => {
     if (!isRecordingStatus(status) || transitionInProgressRef.current) return
@@ -554,48 +739,23 @@ function App() {
     setStatus('processing')
 
     try {
-      if (showRecordingOverlay) {
-        await showOverlayWindow()
-      }
-
-      const audioPath = await invoke<string>('stop_recording')
-      await invoke('set_tray_status', { status: 'processing' })
+      // Stop the microphone first; the overlay resize must not delay the end of capture.
+      const [audioPath] = await Promise.all([
+        invoke<string>('stop_recording'),
+        showRecordingOverlay ? showOverlayWindow() : Promise.resolve(),
+      ])
+      invoke('set_tray_status', { status: 'processing' }).catch(() => {})
       addLog(postProcessEnabled ? 'Finishing transcript with post-processing' : 'Finishing transcript')
 
-      let result: TranscriptionResult
-      let transcriptionModel = FILE_TRANSCRIPTION_MODEL
-      if (liveTranscriptionStartedRef.current) {
-        try {
-          const liveTranscript = await invoke<string>('finish_live_transcription')
-          result = await invoke<TranscriptionResult>('finalize_live_transcript', {
-            transcript: liveTranscript,
-            apiKey,
-            postProcessEnabled,
-            postProcessPrompt: postProcessPrompt || null,
-          })
-          transcriptionModel = LIVE_TRANSCRIPTION_MODEL
-          addLog('Realtime transcript completed')
-        } catch (liveError) {
-          addLog(`Realtime transcription failed; retrying from saved audio: ${liveError}`, 'error')
-          result = await invoke<TranscriptionResult>('transcribe', {
-            audioPath,
-            apiKey,
-            prompt: prompt || null,
-            postProcessEnabled,
-            postProcessPrompt: postProcessPrompt || null,
-          })
-        } finally {
-          liveTranscriptionStartedRef.current = false
-        }
-      } else {
-        result = await invoke<TranscriptionResult>('transcribe', {
-          audioPath,
-          apiKey,
-          prompt: prompt || null,
-          postProcessEnabled,
-          postProcessPrompt: postProcessPrompt || null,
-        })
-      }
+      const startedAt = performance.now()
+      const { transcript: rawTranscript, model: transcriptionModel } = await transcribeRecording(audioPath)
+      const result = await invoke<TranscriptionResult>('finalize_transcript', {
+        transcript: rawTranscript,
+        apiKey,
+        postProcessEnabled,
+        postProcessPrompt: postProcessPrompt || null,
+      })
+      addLog(`Transcribed with ${transcriptionModel} in ${Math.round(performance.now() - startedAt)} ms after stopping`)
 
       if (result.post_process_error) {
         addLog(`Post-processing skipped: ${result.post_process_error}`, 'error')
@@ -615,11 +775,15 @@ function App() {
       })
 
       setStatus('success')
-      scheduleHide(1800)
+      scheduleHide(SUCCESS_HIDE_DELAY_MS)
     } catch (stopError) {
       if (liveTranscriptionStartedRef.current) {
         invoke('cancel_live_transcription').catch(() => {})
         liveTranscriptionStartedRef.current = false
+      }
+      if (localTranscriptionStartedRef.current) {
+        invoke('cancel_local_transcription').catch(() => {})
+        localTranscriptionStartedRef.current = false
       }
       const message = `${stopError}`
       setError(message)
@@ -644,7 +808,7 @@ function App() {
     } finally {
       transitionInProgressRef.current = false
     }
-  }, [addLog, addTranscriptToHistory, apiKey, clearHideTimer, clearLevelPolling, historyRetentionDays, postProcessEnabled, postProcessPrompt, prompt, pruneStoredRecordings, scheduleHide, showOverlayWindow, showRecordingOverlay, showSettingsWindow, status])
+  }, [addLog, addTranscriptToHistory, apiKey, clearHideTimer, clearLevelPolling, historyRetentionDays, postProcessEnabled, postProcessPrompt, pruneStoredRecordings, scheduleHide, showOverlayWindow, showRecordingOverlay, showSettingsWindow, status, transcribeRecording])
 
   const cancelRecording = useCallback(async () => {
     if (!isRecordingStatus(status) || transitionInProgressRef.current) return
@@ -661,14 +825,18 @@ function App() {
       invoke('cancel_live_transcription').catch(() => {})
       liveTranscriptionStartedRef.current = false
     }
+    if (localTranscriptionStartedRef.current) {
+      invoke('cancel_local_transcription').catch(() => {})
+      localTranscriptionStartedRef.current = false
+    }
 
     try {
       await invoke('cancel_recording')
       setError('')
-      setStatus('idle')
-      setViewMode('settings')
       addLog('Recording canceled')
       await hideWindow()
+      setStatus('idle')
+      changeViewMode('settings')
     } catch (cancelError) {
       const message = `Failed to cancel recording: ${cancelError}`
       setError(message)
@@ -677,7 +845,7 @@ function App() {
     } finally {
       transitionInProgressRef.current = false
     }
-  }, [addLog, clearHideTimer, clearLevelPolling, hideWindow, resetWaveform, status])
+  }, [addLog, changeViewMode, clearHideTimer, clearLevelPolling, hideWindow, resetWaveform, status])
 
   const togglePause = useCallback(async () => {
     if (!isRecordingStatus(status) || transitionInProgressRef.current) return
@@ -689,7 +857,7 @@ function App() {
       setStatus(paused ? 'paused' : 'recording')
       if (paused) {
         setAudioLevel(0)
-        resetWaveform(0)
+        resetWaveform()
       }
     } catch (pauseError) {
       const message = `Failed to toggle pause: ${pauseError}`
@@ -774,73 +942,61 @@ function App() {
     error: 'Try Again',
   }
 
-  const overlayStatusText: Record<Exclude<Status, 'idle'>, string> = {
-    recording: 'Recording',
-    paused: 'Paused',
-    processing: 'Transcribing…',
-    success: 'Copied to clipboard',
-    error: 'Something went wrong',
-  }
-
   const renderOverlay = () => {
-    const overlayState = status === 'idle' ? 'recording' : status
+    const overlayState: OverlayState = status === 'idle' ? 'starting' : status
 
     return (
-      <div className={`app overlay ${overlayState}`}>
-        <div className={`overlay-card ${overlayState}`}>
-          <div className={`overlay-waveform ${overlayState}`} data-tauri-drag-region>
-            {waveform.map((level, index) => (
-              <span
-                key={index}
-                className="waveform-bar"
-                style={{ height: `${Math.max(8, Math.round(level * 56))}px` }}
-              />
-            ))}
-          </div>
+      <div className={`app overlay ${overlayLeaving ? 'leaving' : ''}`}>
+        <div className={`pill ${overlayState}`} data-tauri-drag-region>
+          <span className={`pill-dot ${overlayState}`} aria-hidden="true" />
 
-          <div className="overlay-footer">
-            <div className="overlay-status" data-tauri-drag-region>
-              <span className={`overlay-status-dot ${overlayState}`} />
-              <span className="overlay-status-text">
-                {overlayStatusText[overlayState as Exclude<Status, 'idle'>]}
-              </span>
-            </div>
+          {overlayState === 'error' ? (
+            <span className="pill-message error" title={error} role="alert">{error || 'Something went wrong'}</span>
+          ) : (
+            <Waveform levelRef={levelRef} state={overlayState} />
+          )}
 
-            <div className="overlay-actions">
-              {isRecordingStatus(status) && (
-                <>
-                  <button className="overlay-action primary" onClick={stopRecording}>
-                    <span>Stop</span>
-                    <ShortcutKeys keys={['⌘', '⇧', 'Space']} />
-                  </button>
+          <div className="pill-trailing" key={isRecordingStatus(status) ? 'controls' : overlayState}>
+            {(overlayState === 'starting' || isRecordingStatus(status)) && (
+              <>
+                <button
+                  type="button"
+                  className="pill-button"
+                  onClick={togglePause}
+                  disabled={overlayState === 'starting'}
+                  title={status === 'paused' ? 'Resume' : 'Pause'}
+                  aria-label={status === 'paused' ? 'Resume recording' : 'Pause recording'}
+                >
+                  {status === 'paused' ? <PlayIcon /> : <PauseIcon />}
+                </button>
+                <button
+                  type="button"
+                  className="pill-button"
+                  onClick={cancelRecording}
+                  disabled={overlayState === 'starting'}
+                  title="Cancel (Esc)"
+                  aria-label="Cancel recording"
+                >
+                  <CloseIcon />
+                </button>
+                <button
+                  type="button"
+                  className="pill-button stop"
+                  onClick={stopRecording}
+                  disabled={overlayState === 'starting'}
+                  title="Stop (⌘⇧Space)"
+                  aria-label="Stop recording"
+                >
+                  <StopIcon />
+                </button>
+              </>
+            )}
 
-                  <button
-                    className="overlay-icon-action"
-                    onClick={togglePause}
-                    title={status === 'paused' ? 'Resume' : 'Pause'}
-                  >
-                    {status === 'paused' ? '▶' : '❚❚'}
-                  </button>
+            {overlayState === 'processing' && <span className="pill-label">Transcribing</span>}
 
-                  <button className="overlay-action" onClick={cancelRecording}>
-                    <span>Cancel</span>
-                    <ShortcutKeys keys={['Esc']} />
-                  </button>
-                </>
-              )}
-
-              {status === 'processing' && (
-                <div className="overlay-message">Working on the transcript…</div>
-              )}
-
-              {status === 'success' && (
-                <div className="overlay-message success">Ready to paste</div>
-              )}
-
-              {status === 'error' && (
-                <div className="overlay-message error">{error}</div>
-              )}
-            </div>
+            {overlayState === 'success' && (
+              <span className="pill-label success"><CheckIcon />Copied</span>
+            )}
           </div>
         </div>
       </div>
@@ -950,6 +1106,52 @@ function App() {
               <section className="panel-block" aria-labelledby="transcription-heading">
                 <h2 id="transcription-heading">Transcription</h2>
 
+                <label className="field-label" htmlFor="transcription-provider">Engine</label>
+                <select
+                  id="transcription-provider"
+                  className="field-input"
+                  value={transcriptionProvider}
+                  onChange={(event) => handleTranscriptionProviderChange(event.target.value as TranscriptionProvider)}
+                >
+                  <option value="openai">OpenAI (cloud)</option>
+                  <option value="local">On this Mac (private, offline)</option>
+                </select>
+
+                {transcriptionProvider === 'local' ? (
+                  <>
+                    <p className="body-hint">
+                      Uses <code>{LOCAL_TRANSCRIPTION_MODEL}</code> on this Mac, transcribing while you speak.
+                      Vocabulary hints apply to OpenAI only.
+                    </p>
+                    {localModelStatus?.installed ? (
+                      <p className="body-hint"><span className="status-text on">Model ready</span></p>
+                    ) : downloadProgress ? (
+                      <>
+                        <div className="audio-level" aria-hidden="true">
+                          <div
+                            className="audio-level-bar"
+                            style={{ width: `${downloadProgress.total_bytes ? (downloadProgress.downloaded_bytes / downloadProgress.total_bytes) * 100 : 0}%` }}
+                          />
+                        </div>
+                        <p className="body-hint">
+                          Downloading {formatMegabytes(downloadProgress.downloaded_bytes)} of {formatMegabytes(downloadProgress.total_bytes)}
+                        </p>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="text-button"
+                        onClick={downloadLocalModel}
+                        disabled={localModelStatus?.downloading}
+                      >
+                        Download model ({formatMegabytes(localModelStatus?.total_bytes ?? 0)})
+                      </button>
+                    )}
+                  </>
+                ) : (
+                  <p className="body-hint">Recorded audio uses <code>{FILE_TRANSCRIPTION_MODEL}</code>. Live transcription uses <code>{LIVE_TRANSCRIPTION_MODEL}</code> when enabled.</p>
+                )}
+
                 <label className="field-label" htmlFor="api-key">OpenAI API key</label>
                 <input
                   id="api-key"
@@ -959,8 +1161,9 @@ function App() {
                   value={apiKey}
                   onChange={(event) => handleApiKeyChange(event.target.value)}
                 />
-
-                <p className="body-hint">Recorded audio uses <code>{FILE_TRANSCRIPTION_MODEL}</code>. Live transcription uses <code>{LIVE_TRANSCRIPTION_MODEL}</code> when enabled.</p>
+                {transcriptionProvider === 'local' && (
+                  <p className="body-hint">Optional with the local engine; only used for post-processing.</p>
+                )}
               </section>
 
               <section className="panel-block" aria-labelledby="behavior-heading">
@@ -977,7 +1180,7 @@ function App() {
                   </span>
                 </label>
 
-                <label className="checkbox-setting">
+                {transcriptionProvider === 'openai' && <label className="checkbox-setting">
                   <input
                     type="checkbox"
                     checked={realtimeTranscriptionEnabled}
@@ -987,7 +1190,7 @@ function App() {
                     <strong>Transcribe while recording</strong>
                     <small>Reduces the wait after stopping with {LIVE_TRANSCRIPTION_MODEL}.</small>
                   </span>
-                </label>
+                </label>}
               </section>
 
               <section className="panel-block" aria-labelledby="cleanup-heading">
@@ -995,7 +1198,7 @@ function App() {
                   <h2 id="cleanup-heading">Post-processing</h2>
                   <span className={`status-text ${postProcessEnabled ? 'on' : ''}`}>{postProcessEnabled ? 'On' : 'Off'}</span>
                 </div>
-                <p className="body-hint">Optional cleanup pass with gpt-4o-mini before copying.</p>
+                <p className="body-hint">Optional cleanup pass with gpt-4o-mini before copying. Needs an OpenAI API key.</p>
 
                 <label className="checkbox-setting">
                   <input
@@ -1117,7 +1320,7 @@ function App() {
     </div>
   )
 
-  return showRecordingOverlay && viewMode === 'overlay' && status !== 'idle' ? renderOverlay() : renderSettings()
+  return showRecordingOverlay && viewMode === 'overlay' ? renderOverlay() : renderSettings()
 }
 
 export default App

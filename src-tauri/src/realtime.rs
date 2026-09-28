@@ -188,17 +188,10 @@ fn append_segment(transcript: &mut String, segment: &str) {
 }
 
 fn resample_to_pcm16(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<u8> {
-    if samples.is_empty() || source_rate == 0 {
-        return Vec::new();
-    }
-    let output_len = samples.len().saturating_mul(target_rate as usize) / source_rate as usize;
-    let mut output = Vec::with_capacity(output_len * 2);
-    for index in 0..output_len {
-        let source_index = index.saturating_mul(source_rate as usize) / target_rate as usize;
-        let sample = samples[source_index.min(samples.len() - 1)].clamp(-1.0, 1.0);
-        output.extend_from_slice(&((sample * i16::MAX as f32) as i16).to_le_bytes());
-    }
-    output
+    crate::audio::resample(samples, source_rate, target_rate)
+        .into_iter()
+        .flat_map(|sample| ((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).to_le_bytes())
+        .collect()
 }
 
 #[cfg(test)]

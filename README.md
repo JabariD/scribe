@@ -10,7 +10,7 @@ I wanted something simple: hotkey → speak → clipboard. No subscriptions, no 
 
 - **Global Hotkey**: `Cmd+Shift+Space` to start/stop recording
 - **Pause & Cancel**: Pause mid-recording or cancel with `Escape`
-- **OpenAI transcription**: Fast, accurate transcription with optional realtime processing while you speak
+- **OpenAI or on-device transcription**: Use OpenAI, or run NVIDIA Parakeet locally (private, offline, no API key, ~1 s after you stop)
 - **Menubar App**: Lives in your system tray
 - **Auto-clipboard**: Transcriptions copied automatically
 - **Optional realtime mode**: Process speech while recording to reduce the wait after stopping
@@ -40,7 +40,7 @@ Requires: Node.js 18+, Rust, Xcode CLI tools
 ## First Run
 
 1. Click the Scribe icon in your menubar (or run in dev mode)
-2. Enter your OpenAI API key (get one at [platform.openai.com](https://platform.openai.com))
+2. In **Settings → Transcription**, either enter your OpenAI API key (get one at [platform.openai.com](https://platform.openai.com)) or choose **On this Mac** and download the local model (~670 MB)
 3. Press `Cmd+Shift+Space` to start recording
 4. Speak, then press the hotkey again (or click Stop)
 5. Text is automatically copied to your clipboard!
@@ -59,6 +59,7 @@ Requires: Node.js 18+, Rust, Xcode CLI tools
 - **Audio recordings**: `~/Library/VoiceTranscripts/` (timestamped Scribe recordings follow the History retention setting)
 - **API key**: macOS Keychain
 - **Config**: `~/Library/Application Support/scribe/config.json`
+- **Local model**: `~/Library/Application Support/scribe/models/`
 - **Transcript history**: Stored locally in the app webview storage and expired alongside source audio
 
 ## Tech Stack
@@ -67,6 +68,7 @@ Requires: Node.js 18+, Rust, Xcode CLI tools
 - **React** + TypeScript - UI
 - **cpal** - Audio capture
 - **OpenAI transcription models** (`gpt-transcribe` for saved recordings, `gpt-live-transcribe` while recording) - Speech-to-text
+- **NVIDIA Parakeet TDT 0.6B v3** (int8, via [transcribe-rs](https://github.com/cjpais/transcribe-rs) and ONNX Runtime) - Optional on-device speech-to-text, English
 - **OpenAI text model** (`gpt-4o-mini`) - Optional transcript cleanup
 
 ## Permissions Required
@@ -76,7 +78,7 @@ On first run, macOS will ask for:
 
 ## Cost
 
-Transcription cost depends on the selected OpenAI transcription workflow. See OpenAI's current transcription pricing before estimating usage.
+Local transcription is free. OpenAI transcription cost depends on the selected OpenAI transcription workflow. See OpenAI's current transcription pricing before estimating usage.
 
 ## Roadmap
 
